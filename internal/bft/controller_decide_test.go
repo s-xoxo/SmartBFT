@@ -113,7 +113,7 @@ func newDecidingController(t *testing.T, currView Proposer) *Controller {
 		InFlight:    &InFlightData{},
 		currView:    currView,
 		stopChan:    make(chan struct{}),
-		leaderToken: make(chan struct{}, 1),
+		leaderToken: make(chan Proposer, 1),
 	}
 }
 

@@ -460,6 +460,7 @@ func (c *Consensus) createComponents() {
 		NodesList:          c.nodes,
 		LeaderRotation:     c.Config.LeaderRotation,
 		DecisionsPerLeader: c.Config.DecisionsPerLeader,
+		PipelineDepth:      c.Config.EffectivePipelineDepth(),
 		Verifier:           c.Verifier,
 		Logger:             c.Logger,
 		Assembler:          c.Assembler,

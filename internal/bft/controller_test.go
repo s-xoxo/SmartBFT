@@ -34,6 +34,8 @@ func TestControllerBasic(t *testing.T) {
 	batcher := &mocks.Batcher{}
 	batcher.On("Close")
 	pool := &mocks.RequestPool{}
+	pool.On("UnreserveAll").Maybe()
+	pool.On("Reserve", mock.Anything).Maybe()
 	pool.On("Close")
 	leaderMon := &mocks.LeaderMonitor{}
 	leaderMon.On("ChangeRole", mock.Anything, mock.Anything, mock.Anything)
@@ -47,18 +49,19 @@ func TestControllerBasic(t *testing.T) {
 	startedWG.Add(1)
 
 	controller := &bft.Controller{
-		Checkpoint:    &types.Checkpoint{},
-		Batcher:       batcher,
-		RequestPool:   pool,
-		LeaderMonitor: leaderMon,
-		ID:            1, // not the leader
-		N:             4,
-		NodesList:     []uint64{1, 2, 3, 4},
-		Logger:        log,
-		Application:   app,
-		Comm:          comm,
-		Verifier:      verifier,
-		StartedWG:     &startedWG,
+		Checkpoint:       &types.Checkpoint{},
+		Batcher:          batcher,
+		RequestPool:      pool,
+		RequestInspector: rawRequestInspector{},
+		LeaderMonitor:    leaderMon,
+		ID:               1, // not the leader
+		N:                4,
+		NodesList:        []uint64{1, 2, 3, 4},
+		Logger:           log,
+		Application:      app,
+		Comm:             comm,
+		Verifier:         verifier,
+		StartedWG:        &startedWG,
 	}
 	controller.Deliver = &bft.MutuallyExclusiveDeliver{C: controller}
 
@@ -91,6 +94,8 @@ func TestControllerLeaderBasic(t *testing.T) {
 		})
 	}).Return([][]byte{})
 	pool := &mocks.RequestPool{}
+	pool.On("UnreserveAll").Maybe()
+	pool.On("Reserve", mock.Anything).Maybe()
 	pool.On("Close")
 	leaderMon := &mocks.LeaderMonitor{}
 	leaderMon.On("ChangeRole", bft.Leader, mock.Anything, mock.Anything)
@@ -104,18 +109,19 @@ func TestControllerLeaderBasic(t *testing.T) {
 	startedWG.Add(1)
 
 	controller := &bft.Controller{
-		InFlight:      &bft.InFlightData{},
-		Checkpoint:    &types.Checkpoint{},
-		RequestPool:   pool,
-		LeaderMonitor: leaderMon,
-		ID:            2, // the leader
-		N:             4,
-		NodesList:     []uint64{1, 2, 3, 4},
-		Logger:        log,
-		Batcher:       batcher,
-		Comm:          commMock,
-		Verifier:      verifier,
-		StartedWG:     &startedWG,
+		InFlight:         &bft.InFlightData{},
+		Checkpoint:       &types.Checkpoint{},
+		RequestPool:      pool,
+		RequestInspector: rawRequestInspector{},
+		LeaderMonitor:    leaderMon,
+		ID:               2, // the leader
+		N:                4,
+		NodesList:        []uint64{1, 2, 3, 4},
+		Logger:           log,
+		Batcher:          batcher,
+		Comm:             commMock,
+		Verifier:         verifier,
+		StartedWG:        &startedWG,
 	}
 	controller.Deliver = &bft.MutuallyExclusiveDeliver{C: controller}
 
@@ -175,6 +181,8 @@ func TestLeaderPropose(t *testing.T) {
 		appWG.Done()
 	}).Return(types.Reconfig{InLatestDecision: false})
 	reqPool := &mocks.RequestPool{}
+	reqPool.On("UnreserveAll").Maybe()
+	reqPool.On("Reserve", mock.Anything).Maybe()
 	reqPool.On("Prune", mock.Anything)
 	reqPool.On("Close")
 	leaderMon := &mocks.LeaderMonitor{}
@@ -204,26 +212,27 @@ func TestLeaderPropose(t *testing.T) {
 	startedWG.Add(1)
 
 	controller := &bft.Controller{
-		InFlight:      &bft.InFlightData{},
-		RequestPool:   reqPool,
-		LeaderMonitor: leaderMon,
-		WAL:           wal,
-		ID:            17, // the leader
-		N:             4,
-		NodesList:     []uint64{11, 17, 23, 37},
-		Logger:        log,
-		Batcher:       batcher,
-		Verifier:      verifier,
-		Assembler:     assembler,
-		Comm:          comm,
-		Signer:        signer,
-		Application:   app,
-		Checkpoint:    &types.Checkpoint{},
-		ViewChanger:   &bft.ViewChanger{},
-		Synchronizer:  synchronizer,
-		Collector:     &collector,
-		StartedWG:     &startedWG,
-		MetricsView:   api.NewMetricsView(&disabled.Provider{}),
+		InFlight:         &bft.InFlightData{},
+		RequestPool:      reqPool,
+		RequestInspector: rawRequestInspector{},
+		LeaderMonitor:    leaderMon,
+		WAL:              wal,
+		ID:               17, // the leader
+		N:                4,
+		NodesList:        []uint64{11, 17, 23, 37},
+		Logger:           log,
+		Batcher:          batcher,
+		Verifier:         verifier,
+		Assembler:        assembler,
+		Comm:             comm,
+		Signer:           signer,
+		Application:      app,
+		Checkpoint:       &types.Checkpoint{},
+		ViewChanger:      &bft.ViewChanger{},
+		Synchronizer:     synchronizer,
+		Collector:        &collector,
+		StartedWG:        &startedWG,
+		MetricsView:      api.NewMetricsView(&disabled.Provider{}),
 	}
 	controller.Deliver = &bft.MutuallyExclusiveDeliver{C: controller}
 
@@ -335,6 +344,8 @@ func TestLeaderProposeDrivesBatchTuner(t *testing.T) {
 		appWG.Done()
 	}).Return(types.Reconfig{InLatestDecision: false})
 	reqPool := &mocks.RequestPool{}
+	reqPool.On("UnreserveAll").Maybe()
+	reqPool.On("Reserve", mock.Anything).Maybe()
 	reqPool.On("Prune", mock.Anything)
 	reqPool.On("Close")
 	leaderMon := &mocks.LeaderMonitor{}
@@ -364,26 +375,27 @@ func TestLeaderProposeDrivesBatchTuner(t *testing.T) {
 	startedWG.Add(1)
 
 	controller := &bft.Controller{
-		InFlight:      &bft.InFlightData{},
-		RequestPool:   reqPool,
-		LeaderMonitor: leaderMon,
-		WAL:           wal,
-		ID:            17, // the leader
-		N:             4,
-		NodesList:     []uint64{11, 17, 23, 37},
-		Logger:        log,
-		Batcher:       batcher,
-		Verifier:      verifier,
-		Assembler:     assembler,
-		Comm:          comm,
-		Signer:        signer,
-		Application:   app,
-		Checkpoint:    &types.Checkpoint{},
-		ViewChanger:   &bft.ViewChanger{},
-		Synchronizer:  synchronizer,
-		Collector:     &collector,
-		StartedWG:     &startedWG,
-		MetricsView:   api.NewMetricsView(&disabled.Provider{}),
+		InFlight:         &bft.InFlightData{},
+		RequestPool:      reqPool,
+		RequestInspector: rawRequestInspector{},
+		LeaderMonitor:    leaderMon,
+		WAL:              wal,
+		ID:               17, // the leader
+		N:                4,
+		NodesList:        []uint64{11, 17, 23, 37},
+		Logger:           log,
+		Batcher:          batcher,
+		Verifier:         verifier,
+		Assembler:        assembler,
+		Comm:             comm,
+		Signer:           signer,
+		Application:      app,
+		Checkpoint:       &types.Checkpoint{},
+		ViewChanger:      &bft.ViewChanger{},
+		Synchronizer:     synchronizer,
+		Collector:        &collector,
+		StartedWG:        &startedWG,
+		MetricsView:      api.NewMetricsView(&disabled.Provider{}),
 	}
 	controller.Deliver = &bft.MutuallyExclusiveDeliver{C: controller}
 
@@ -475,6 +487,8 @@ func TestViewChanged(t *testing.T) {
 		commWG.Done()
 	})
 	reqPool := &mocks.RequestPool{}
+	reqPool.On("UnreserveAll").Maybe()
+	reqPool.On("Reserve", mock.Anything).Maybe()
 	reqPool.On("Prune", mock.Anything)
 	reqPool.On("Close")
 	leaderMon := &mocks.LeaderMonitor{}
@@ -508,23 +522,24 @@ func TestViewChanged(t *testing.T) {
 	startedWG.Add(1)
 
 	controller := &bft.Controller{
-		InFlight:      &bft.InFlightData{},
-		Checkpoint:    &types.Checkpoint{},
-		Signer:        signer,
-		WAL:           wal,
-		ID:            3, // the next leader
-		N:             4,
-		NodesList:     []uint64{1, 2, 3, 4},
-		Logger:        log,
-		Batcher:       batcher,
-		Verifier:      verifier,
-		Assembler:     assembler,
-		Comm:          comm,
-		RequestPool:   reqPool,
-		LeaderMonitor: leaderMon,
-		Synchronizer:  synchronizer,
-		Collector:     &collector,
-		StartedWG:     &startedWG,
+		InFlight:         &bft.InFlightData{},
+		Checkpoint:       &types.Checkpoint{},
+		Signer:           signer,
+		WAL:              wal,
+		ID:               3, // the next leader
+		N:                4,
+		NodesList:        []uint64{1, 2, 3, 4},
+		Logger:           log,
+		Batcher:          batcher,
+		Verifier:         verifier,
+		Assembler:        assembler,
+		Comm:             comm,
+		RequestPool:      reqPool,
+		RequestInspector: rawRequestInspector{},
+		LeaderMonitor:    leaderMon,
+		Synchronizer:     synchronizer,
+		Collector:        &collector,
+		StartedWG:        &startedWG,
 	}
 	controller.Deliver = &bft.MutuallyExclusiveDeliver{C: controller}
 
@@ -558,6 +573,8 @@ func TestSyncPrevView(t *testing.T) {
 	batcher := &mocks.Batcher{}
 	batcher.On("Close")
 	pool := &mocks.RequestPool{}
+	pool.On("UnreserveAll").Maybe()
+	pool.On("Reserve", mock.Anything).Maybe()
 	pool.On("Close")
 	pool.On("Prune", mock.Anything)
 	leaderMon := &mocks.LeaderMonitor{}
@@ -612,26 +629,27 @@ func TestSyncPrevView(t *testing.T) {
 	defer collector.Stop()
 
 	controller := &bft.Controller{
-		Collector:       &collector,
-		InFlight:        &bft.InFlightData{},
-		Batcher:         batcher,
-		RequestPool:     pool,
-		LeaderMonitor:   leaderMon,
-		ID:              4, // not the leader
-		N:               4,
-		NodesList:       []uint64{1, 2, 3, 4},
-		Logger:          log,
-		Application:     app,
-		Comm:            comm,
-		ViewChanger:     &bft.ViewChanger{},
-		Checkpoint:      &types.Checkpoint{},
-		FailureDetector: fd,
-		Synchronizer:    synchronizer,
-		Verifier:        verifier,
-		Signer:          signer,
-		WAL:             wal,
-		StartedWG:       &startedWG,
-		MetricsView:     api.NewMetricsView(&disabled.Provider{}),
+		Collector:        &collector,
+		InFlight:         &bft.InFlightData{},
+		Batcher:          batcher,
+		RequestPool:      pool,
+		RequestInspector: rawRequestInspector{},
+		LeaderMonitor:    leaderMon,
+		ID:               4, // not the leader
+		N:                4,
+		NodesList:        []uint64{1, 2, 3, 4},
+		Logger:           log,
+		Application:      app,
+		Comm:             comm,
+		ViewChanger:      &bft.ViewChanger{},
+		Checkpoint:       &types.Checkpoint{},
+		FailureDetector:  fd,
+		Synchronizer:     synchronizer,
+		Verifier:         verifier,
+		Signer:           signer,
+		WAL:              wal,
+		StartedWG:        &startedWG,
+		MetricsView:      api.NewMetricsView(&disabled.Provider{}),
 	}
 	controller.Deliver = &bft.MutuallyExclusiveDeliver{C: controller}
 
@@ -751,6 +769,8 @@ func TestControllerLeaderRequestHandling(t *testing.T) {
 			})
 
 			pool := &mocks.RequestPool{}
+			pool.On("UnreserveAll").Maybe()
+			pool.On("Reserve", mock.Anything).Maybe()
 			pool.On("Close")
 			leaderMon := &mocks.LeaderMonitor{}
 			leaderMon.On("ChangeRole", bft.Follower, mock.Anything, mock.Anything)
@@ -789,20 +809,21 @@ func TestControllerLeaderRequestHandling(t *testing.T) {
 			startedWG.Add(1)
 
 			controller := &bft.Controller{
-				InFlight:      &bft.InFlightData{},
-				Checkpoint:    &types.Checkpoint{},
-				RequestPool:   pool,
-				LeaderMonitor: leaderMon,
-				ID:            1,
-				N:             4,
-				NodesList:     []uint64{0, 1, 2, 3},
-				Logger:        log,
-				Batcher:       batcher,
-				Comm:          commMock,
-				Verifier:      verifier,
-				Synchronizer:  synchronizer,
-				Collector:     &collector,
-				StartedWG:     &startedWG,
+				InFlight:         &bft.InFlightData{},
+				Checkpoint:       &types.Checkpoint{},
+				RequestPool:      pool,
+				RequestInspector: rawRequestInspector{},
+				LeaderMonitor:    leaderMon,
+				ID:               1,
+				N:                4,
+				NodesList:        []uint64{0, 1, 2, 3},
+				Logger:           log,
+				Batcher:          batcher,
+				Comm:             commMock,
+				Verifier:         verifier,
+				Synchronizer:     synchronizer,
+				Collector:        &collector,
+				StartedWG:        &startedWG,
 			}
 			controller.Deliver = &bft.MutuallyExclusiveDeliver{C: controller}
 
@@ -906,6 +927,8 @@ func TestSyncInform(t *testing.T) {
 	commWithChan.On("Nodes").Return([]uint64{0, 1, 2, 3})
 
 	reqPool := &mocks.RequestPool{}
+	reqPool.On("UnreserveAll").Maybe()
+	reqPool.On("Reserve", mock.Anything).Maybe()
 	reqPool.On("Close")
 	leaderMon := &mocks.LeaderMonitor{}
 	leaderMon.On("ChangeRole", bft.Follower, mock.Anything, mock.Anything)
@@ -969,24 +992,25 @@ func TestSyncInform(t *testing.T) {
 	vc.ControllerStartedWG.Add(1)
 
 	controller := &bft.Controller{
-		InFlight:      &bft.InFlightData{},
-		Signer:        signer,
-		WAL:           wal,
-		ID:            2,
-		N:             4,
-		NodesList:     []uint64{0, 1, 2, 3},
-		Logger:        log,
-		Batcher:       batcher,
-		Verifier:      verifier,
-		Assembler:     assembler,
-		Comm:          comm,
-		RequestPool:   reqPool,
-		LeaderMonitor: leaderMon,
-		Synchronizer:  synchronizer,
-		ViewChanger:   vc,
-		Checkpoint:    &types.Checkpoint{},
-		Collector:     &collector,
-		StartedWG:     &vc.ControllerStartedWG,
+		InFlight:         &bft.InFlightData{},
+		Signer:           signer,
+		WAL:              wal,
+		ID:               2,
+		N:                4,
+		NodesList:        []uint64{0, 1, 2, 3},
+		Logger:           log,
+		Batcher:          batcher,
+		Verifier:         verifier,
+		Assembler:        assembler,
+		Comm:             comm,
+		RequestPool:      reqPool,
+		RequestInspector: rawRequestInspector{},
+		LeaderMonitor:    leaderMon,
+		Synchronizer:     synchronizer,
+		ViewChanger:      vc,
+		Checkpoint:       &types.Checkpoint{},
+		Collector:        &collector,
+		StartedWG:        &vc.ControllerStartedWG,
 	}
 	controller.Deliver = &bft.MutuallyExclusiveDeliver{C: controller}
 	configureProposerBuilder(controller)
@@ -1030,6 +1054,8 @@ func TestRotateFromLeaderToFollower(t *testing.T) {
 	var restartTimersWG sync.WaitGroup
 	restartTimersWG.Add(2)
 	reqPool := &mocks.RequestPool{}
+	reqPool.On("UnreserveAll").Maybe()
+	reqPool.On("Reserve", mock.Anything).Maybe()
 	reqPool.On("RestartTimers").Run(func(args mock.Arguments) {
 		restartTimersWG.Done()
 	})
@@ -1086,6 +1112,7 @@ func TestRotateFromLeaderToFollower(t *testing.T) {
 	controller := &bft.Controller{
 		InFlight:           &bft.InFlightData{},
 		RequestPool:        reqPool,
+		RequestInspector:   rawRequestInspector{},
 		LeaderMonitor:      leaderMon,
 		WAL:                wal,
 		ID:                 2, // the first leader
@@ -1190,6 +1217,8 @@ func TestRotateFromFollowerToLeader(t *testing.T) {
 	var restartTimersWG sync.WaitGroup
 	restartTimersWG.Add(2)
 	reqPool := &mocks.RequestPool{}
+	reqPool.On("UnreserveAll").Maybe()
+	reqPool.On("Reserve", mock.Anything).Maybe()
 	reqPool.On("Prune", mock.Anything)
 	reqPool.On("Close")
 	reqPool.On("RestartTimers").Run(func(args mock.Arguments) {
@@ -1268,6 +1297,7 @@ func TestRotateFromFollowerToLeader(t *testing.T) {
 	controller := &bft.Controller{
 		InFlight:           &bft.InFlightData{},
 		RequestPool:        reqPool,
+		RequestInspector:   rawRequestInspector{},
 		LeaderMonitor:      leaderMon,
 		WAL:                wal,
 		ID:                 3, // the second leader
@@ -1410,6 +1440,8 @@ func TestDeliverTwiceOnceFromSyncAndOnceFromViewData(t *testing.T) {
 	assembler := &mocks.AssemblerMock{}
 
 	reqPool := &mocks.RequestPool{}
+	reqPool.On("UnreserveAll").Maybe()
+	reqPool.On("Reserve", mock.Anything).Maybe()
 	reqPool.On("Close")
 
 	leaderMon := &mocks.LeaderMonitor{}
@@ -1497,25 +1529,26 @@ func TestDeliverTwiceOnceFromSyncAndOnceFromViewData(t *testing.T) {
 	vc.ControllerStartedWG.Add(1)
 
 	controller := &bft.Controller{
-		InFlight:      &bft.InFlightData{},
-		Signer:        signer,
-		State:         state,
-		WAL:           wal,
-		ID:            4,
-		N:             7,
-		NodesList:     []uint64{1, 2, 3, 4, 5, 6, 7},
-		Logger:        log,
-		Batcher:       batcher,
-		Verifier:      verifier,
-		Assembler:     assembler,
-		Comm:          comm,
-		RequestPool:   reqPool,
-		LeaderMonitor: leaderMon,
-		Synchronizer:  synchronizer,
-		ViewChanger:   vc,
-		Checkpoint:    &types.Checkpoint{},
-		Collector:     &collector,
-		StartedWG:     &vc.ControllerStartedWG,
+		InFlight:         &bft.InFlightData{},
+		Signer:           signer,
+		State:            state,
+		WAL:              wal,
+		ID:               4,
+		N:                7,
+		NodesList:        []uint64{1, 2, 3, 4, 5, 6, 7},
+		Logger:           log,
+		Batcher:          batcher,
+		Verifier:         verifier,
+		Assembler:        assembler,
+		Comm:             comm,
+		RequestPool:      reqPool,
+		RequestInspector: rawRequestInspector{},
+		LeaderMonitor:    leaderMon,
+		Synchronizer:     synchronizer,
+		ViewChanger:      vc,
+		Checkpoint:       &types.Checkpoint{},
+		Collector:        &collector,
+		StartedWG:        &vc.ControllerStartedWG,
 	}
 	configureProposerBuilder(controller)
 
@@ -1748,6 +1781,8 @@ func TestControllerKeepsRunningAfterDecideWaiterLeft(t *testing.T) {
 	batcher := &mocks.Batcher{}
 	batcher.On("Close")
 	pool := &mocks.RequestPool{}
+	pool.On("UnreserveAll").Maybe()
+	pool.On("Reserve", mock.Anything).Maybe()
 	pool.On("Close")
 	leaderMon := &mocks.LeaderMonitor{}
 	leaderMon.On("ChangeRole", mock.Anything, mock.Anything, mock.Anything)
@@ -1768,18 +1803,19 @@ func TestControllerKeepsRunningAfterDecideWaiterLeft(t *testing.T) {
 	startedWG.Add(1)
 
 	controller := &bft.Controller{
-		Checkpoint:      &types.Checkpoint{},
-		Batcher:         batcher,
-		RequestPool:     pool,
-		LeaderMonitor:   leaderMon,
-		ID:              3, // not the leader of view 0 nor of view 1
-		N:               4,
-		NodesList:       []uint64{1, 2, 3, 4},
-		Logger:          log,
-		Deliver:         app,
-		Verifier:        verifier,
-		ProposerBuilder: pb,
-		StartedWG:       &startedWG,
+		Checkpoint:       &types.Checkpoint{},
+		Batcher:          batcher,
+		RequestPool:      pool,
+		RequestInspector: rawRequestInspector{},
+		LeaderMonitor:    leaderMon,
+		ID:               3, // not the leader of view 0 nor of view 1
+		N:                4,
+		NodesList:        []uint64{1, 2, 3, 4},
+		Logger:           log,
+		Deliver:          app,
+		Verifier:         verifier,
+		ProposerBuilder:  pb,
+		StartedWG:        &startedWG,
 	}
 
 	controller.Start(0, 1, 0, 1, false)
@@ -1845,3 +1881,11 @@ func (*fakeProposer) GetMetadata() []byte {
 }
 
 func (*fakeProposer) HandleMessage(uint64, *protos.Message) {}
+
+// rawRequestInspector identifies a request by its raw bytes; the controller reserves the requests it
+// proposes by their identity, and the requests of these tests are arbitrary bytes.
+type rawRequestInspector struct{}
+
+func (rawRequestInspector) RequestID(req []byte) types.RequestInfo {
+	return types.RequestInfo{ClientID: "raw", ID: string(req)}
+}
