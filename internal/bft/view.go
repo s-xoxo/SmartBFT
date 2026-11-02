@@ -115,7 +115,11 @@ type View struct {
 	nextPrepares   *voteSet
 	nextCommits    *voteSet
 
-	beginPrePrepare    time.Time
+	// prePrepareBegin records, per proposal sequence, when this node accepted the pre-prepare,
+	// so that view_latency_batch_processing is measured for the sequence that is committed.
+	// Only the view goroutine touches it after Start; it is seeded before Start by a restore
+	// from the WAL or by the view changer committing an in-flight proposal.
+	prePrepareBegin    map[uint64]time.Time
 	MetricsBlacklist   *api.MetricsBlacklist
 	MetricsView        *api.MetricsView
 	blacklistSupported bool
@@ -345,10 +349,32 @@ func (v *View) prepared() Phase {
 		size += len(signatures[i].Value) + len(signatures[i].Msg)
 	}
 	v.MetricsView.SizeOfBatch.Add(float64(size))
-	v.MetricsView.LatencyBatchProcessing.Observe(time.Since(v.beginPrePrepare).Seconds())
+	v.observeBatchProcessingLatency(seq)
 
 	v.decide(proposal, signatures, v.inFlightRequests)
+	v.MetricsView.InFlightProposals.Set(float64(len(v.prePrepareBegin)))
 	return COMMITTED
+}
+
+// recordPrePrepareBegin marks the time this node accepted the pre-prepare of the given sequence,
+// from which the latency of processing its proposal is measured, and counts it as in flight.
+func (v *View) recordPrePrepareBegin(seq uint64) {
+	if v.prePrepareBegin == nil {
+		v.prePrepareBegin = make(map[uint64]time.Time)
+	}
+	v.prePrepareBegin[seq] = time.Now()
+	v.MetricsView.InFlightProposals.Set(float64(len(v.prePrepareBegin)))
+}
+
+// observeBatchProcessingLatency observes the time from the pre-prepare of the given sequence
+// to its commit quorum, and forgets the sequence. A sequence without a recorded pre-prepare is skipped.
+func (v *View) observeBatchProcessingLatency(seq uint64) {
+	begin, recorded := v.prePrepareBegin[seq]
+	if !recorded {
+		return
+	}
+	delete(v.prePrepareBegin, seq)
+	v.MetricsView.LatencyBatchProcessing.Observe(time.Since(begin).Seconds())
 }
 
 func (v *View) processProposal() Phase {
@@ -396,9 +422,9 @@ func (v *View) processProposal() Phase {
 	}
 
 	v.MetricsView.CountTxsInBatch.Set(float64(len(requests)))
-	v.beginPrePrepare = time.Now()
 
 	seq := v.ProposalSequence
+	v.recordPrePrepareBegin(seq)
 
 	prepareMessage := v.createPrepare(seq, proposal)
 

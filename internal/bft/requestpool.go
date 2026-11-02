@@ -277,6 +277,7 @@ func (rp *Pool) Submit(request []byte) error {
 	}
 
 	rp.sizeBytes += uint64(len(element.Value.(*requestItem).request))
+	rp.metrics.SizeBytesOfRequestPool.Set(float64(rp.sizeBytes))
 
 	return nil
 }
@@ -383,6 +384,7 @@ func (rp *Pool) RemoveRequest(requestInfo types.RequestInfo) error {
 
 	rp.deleteRequest(element, requestInfo)
 	rp.sizeBytes -= uint64(len(element.Value.(*requestItem).request))
+	rp.metrics.SizeBytesOfRequestPool.Set(float64(rp.sizeBytes))
 	return nil
 }
 

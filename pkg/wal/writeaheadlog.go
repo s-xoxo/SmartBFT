@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/hyperledger/SmartBFT/pkg/api"
 	"github.com/hyperledger/SmartBFT/pkg/metrics/disabled"
@@ -420,7 +421,11 @@ func (w *WriteAheadLogFile) Append(data []byte, truncateTo bool) error {
 	w.mutex.Lock()
 	defer w.mutex.Unlock()
 
-	return w.append(record)
+	begin := time.Now()
+	err := w.append(record)
+	w.metrics.LatencyAppend.Observe(time.Since(begin).Seconds())
+
+	return err
 }
 
 func (w *WriteAheadLogFile) append(record *protos.LogRecord) error {

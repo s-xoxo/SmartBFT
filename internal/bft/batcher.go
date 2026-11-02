@@ -8,6 +8,9 @@ package bft
 import (
 	"sync"
 	"time"
+
+	"github.com/hyperledger/SmartBFT/pkg/api"
+	"github.com/hyperledger/SmartBFT/pkg/metrics/disabled"
 )
 
 // BatchBuilder implements Batcher
@@ -19,10 +22,15 @@ type BatchBuilder struct {
 	batchTimeout  time.Duration
 	closeChan     chan struct{}
 	closeLock     sync.Mutex // Reset and Close may be called by different threads
+	metrics       *api.MetricsBatcher
 }
 
-// NewBatchBuilder creates a new BatchBuilder
-func NewBatchBuilder(pool RequestPool, submittedChan chan struct{}, maxMsgCount uint64, maxSizeBytes uint64, batchTimeout time.Duration) *BatchBuilder {
+// NewBatchBuilder creates a new BatchBuilder.
+// A nil metrics disables the batcher metrics.
+func NewBatchBuilder(pool RequestPool, submittedChan chan struct{}, maxMsgCount uint64, maxSizeBytes uint64, batchTimeout time.Duration, metrics *api.MetricsBatcher) *BatchBuilder {
+	if metrics == nil {
+		metrics = api.NewMetricsBatcher(&disabled.Provider{})
+	}
 	b := &BatchBuilder{
 		pool:          pool,
 		submittedChan: submittedChan,
@@ -30,6 +38,7 @@ func NewBatchBuilder(pool RequestPool, submittedChan chan struct{}, maxMsgCount 
 		maxSizeBytes:  maxSizeBytes,
 		batchTimeout:  batchTimeout,
 		closeChan:     make(chan struct{}),
+		metrics:       metrics,
 	}
 	return b
 }
@@ -40,6 +49,7 @@ func NewBatchBuilder(pool RequestPool, submittedChan chan struct{}, maxMsgCount 
 func (b *BatchBuilder) NextBatch() [][]byte {
 	currBatch, full := b.pool.NextRequests(b.maxMsgCount, b.maxSizeBytes, true)
 	if full {
+		b.countBatch(currBatch, api.ReasonBatchFull)
 		return currBatch
 	}
 
@@ -51,15 +61,28 @@ func (b *BatchBuilder) NextBatch() [][]byte {
 			return nil
 		case <-timeout:
 			currBatch, _ = b.pool.NextRequests(b.maxMsgCount, b.maxSizeBytes, false)
+			b.countBatch(currBatch, api.ReasonBatchTimeout)
 			return currBatch
 		case <-b.submittedChan:
 			// there is a possibility to extend the current batch
 			currBatch, full = b.pool.NextRequests(b.maxMsgCount, b.maxSizeBytes, true)
 			if full {
+				b.countBatch(currBatch, api.ReasonBatchFull)
 				return currBatch
 			}
 		}
 	}
+}
+
+// countBatch counts a returned batch by the reason it was closed.
+// An empty batch, returned when the timeout expires on an idle pool, is not a batch and is not counted.
+func (b *BatchBuilder) countBatch(batch [][]byte, reason string) {
+	if len(batch) == 0 {
+		return
+	}
+	b.metrics.CountOfBatches.With(
+		b.metrics.LabelsForWith("reason", reason)...,
+	).Add(1)
 }
 
 // Close closes the close channel to stop NextBatch

@@ -12,6 +12,11 @@ import (
 const (
 	ReasonRequestMaxBytes      = "MAX_BYTES"
 	ReasonSemaphoreAcquireFail = "SEMAPHORE_ACQUIRE_FAIL"
+
+	// ReasonBatchFull labels a batch that was returned because it reached the maximum request count or size.
+	ReasonBatchFull = "FULL"
+	// ReasonBatchTimeout labels a batch that was returned because the batch timeout expired before it got full.
+	ReasonBatchTimeout = "TIMEOUT"
 )
 
 func NewGaugeOpts(old metrics.GaugeOpts, labelNames []string) metrics.GaugeOpts {
@@ -72,6 +77,7 @@ func makeLabelNames(labelNames []string, names ...string) []string {
 
 type Metrics struct {
 	MetricsRequestPool *MetricsRequestPool
+	MetricsBatcher     *MetricsBatcher
 	MetricsBlacklist   *MetricsBlacklist
 	MetricsConsensus   *MetricsConsensus
 	MetricsView        *MetricsView
@@ -81,6 +87,7 @@ type Metrics struct {
 func NewMetrics(p metrics.Provider, labelNames ...string) *Metrics {
 	return &Metrics{
 		MetricsRequestPool: NewMetricsRequestPool(p, labelNames...),
+		MetricsBatcher:     NewMetricsBatcher(p, labelNames...),
 		MetricsBlacklist:   NewMetricsBlacklist(p, labelNames...),
 		MetricsConsensus:   NewMetricsConsensus(p, labelNames...),
 		MetricsView:        NewMetricsView(p, labelNames...),
@@ -91,6 +98,7 @@ func NewMetrics(p metrics.Provider, labelNames ...string) *Metrics {
 func (m *Metrics) With(labelValues ...string) *Metrics {
 	return &Metrics{
 		MetricsRequestPool: m.MetricsRequestPool.With(labelValues...),
+		MetricsBatcher:     m.MetricsBatcher.With(labelValues...),
 		MetricsBlacklist:   m.MetricsBlacklist.With(labelValues...),
 		MetricsConsensus:   m.MetricsConsensus.With(labelValues...),
 		MetricsView:        m.MetricsView.With(labelValues...),
@@ -100,6 +108,7 @@ func (m *Metrics) With(labelValues ...string) *Metrics {
 
 func (m *Metrics) Initialize(nodes []uint64) {
 	m.MetricsRequestPool.Initialize()
+	m.MetricsBatcher.Initialize()
 	m.MetricsBlacklist.Initialize(nodes)
 	m.MetricsConsensus.Initialize()
 	m.MetricsView.Initialize()
@@ -111,6 +120,16 @@ var countOfRequestPoolOpts = metrics.GaugeOpts{
 	Subsystem:    "smartbft",
 	Name:         "pool_count_of_elements",
 	Help:         "Number of elements in the consensus request pool.",
+	LabelNames:   []string{},
+	StatsdFormat: "%{#fqname}",
+}
+
+// sizeBytesOfRequestPoolOpts mirrors the byte total the pool keeps for its batching size limit.
+var sizeBytesOfRequestPoolOpts = metrics.GaugeOpts{
+	Namespace:    "consensus",
+	Subsystem:    "smartbft",
+	Name:         "pool_size_bytes_of_elements",
+	Help:         "Total size in bytes of the elements in the consensus request pool.",
 	LabelNames:   []string{},
 	StatsdFormat: "%{#fqname}",
 }
@@ -174,6 +193,7 @@ var latencyOfRequestPoolOpts = metrics.HistogramOpts{
 // MetricsRequestPool encapsulates request pool metrics
 type MetricsRequestPool struct {
 	CountOfRequestPool          metrics.Gauge
+	SizeBytesOfRequestPool      metrics.Gauge
 	CountOfFailAddRequestToPool metrics.Counter
 	CountOfLeaderForwardRequest metrics.Counter
 	CountTimeoutTwoStep         metrics.Counter
@@ -187,6 +207,7 @@ type MetricsRequestPool struct {
 // NewMetricsRequestPool create new request pool metrics
 func NewMetricsRequestPool(p metrics.Provider, labelNames ...string) *MetricsRequestPool {
 	countOfRequestPoolOptsTmp := NewGaugeOpts(countOfRequestPoolOpts, labelNames)
+	sizeBytesOfRequestPoolOptsTmp := NewGaugeOpts(sizeBytesOfRequestPoolOpts, labelNames)
 	countOfFailAddRequestToPoolOptsTmp := NewCounterOpts(countOfFailAddRequestToPoolOpts, labelNames)
 	countOfLeaderForwardRequestOptsTmp := NewCounterOpts(countOfLeaderForwardRequestOpts, labelNames)
 	countTimeoutTwoStepOptsTmp := NewCounterOpts(countTimeoutTwoStepOpts, labelNames)
@@ -195,6 +216,7 @@ func NewMetricsRequestPool(p metrics.Provider, labelNames ...string) *MetricsReq
 	latencyOfRequestPoolOptsTmp := NewHistogramOpts(latencyOfRequestPoolOpts, labelNames)
 	return &MetricsRequestPool{
 		CountOfRequestPool:          p.NewGauge(countOfRequestPoolOptsTmp),
+		SizeBytesOfRequestPool:      p.NewGauge(sizeBytesOfRequestPoolOptsTmp),
 		CountOfFailAddRequestToPool: p.NewCounter(countOfFailAddRequestToPoolOptsTmp),
 		CountOfLeaderForwardRequest: p.NewCounter(countOfLeaderForwardRequestOptsTmp),
 		CountTimeoutTwoStep:         p.NewCounter(countTimeoutTwoStepOptsTmp),
@@ -207,6 +229,7 @@ func NewMetricsRequestPool(p metrics.Provider, labelNames ...string) *MetricsReq
 func (m *MetricsRequestPool) With(labelValues ...string) *MetricsRequestPool {
 	return &MetricsRequestPool{
 		CountOfRequestPool:          m.CountOfRequestPool.With(labelValues...),
+		SizeBytesOfRequestPool:      m.SizeBytesOfRequestPool.With(labelValues...),
 		CountOfFailAddRequestToPool: m.CountOfFailAddRequestToPool,
 		CountOfLeaderForwardRequest: m.CountOfLeaderForwardRequest.With(labelValues...),
 		CountTimeoutTwoStep:         m.CountTimeoutTwoStep.With(labelValues...),
@@ -219,6 +242,7 @@ func (m *MetricsRequestPool) With(labelValues ...string) *MetricsRequestPool {
 
 func (m *MetricsRequestPool) Initialize() {
 	m.CountOfRequestPool.Add(0)
+	m.SizeBytesOfRequestPool.Add(0)
 	m.CountOfFailAddRequestToPool.With(
 		m.LabelsForWith("reason", ReasonRequestMaxBytes)...,
 	).Add(0)
@@ -233,6 +257,56 @@ func (m *MetricsRequestPool) Initialize() {
 }
 
 func (m *MetricsRequestPool) LabelsForWith(labelValues ...string) []string {
+	result := make([]string, 0, len(m.labels)+len(labelValues))
+	result = append(result, labelValues...)
+	result = append(result, m.labels...)
+	return result
+}
+
+// countOfBatchesOpts counts the non-empty batches the batcher returned, labeled by why the batch
+// was closed: it reached the maximum request count or size (FULL), or the batch timeout expired (TIMEOUT).
+// Empty batches returned after a timeout on an idle pool are not counted.
+var countOfBatchesOpts = metrics.CounterOpts{
+	Namespace:    "consensus",
+	Subsystem:    "smartbft",
+	Name:         "batcher_count_of_batches",
+	Help:         "Number of batches returned by the batcher, by the reason the batch was closed.",
+	LabelNames:   []string{"reason"},
+	StatsdFormat: "%{#fqname}.%{reason}",
+}
+
+// MetricsBatcher encapsulates batcher metrics
+type MetricsBatcher struct {
+	CountOfBatches metrics.Counter
+
+	labels []string
+}
+
+// NewMetricsBatcher create new batcher metrics
+func NewMetricsBatcher(p metrics.Provider, labelNames ...string) *MetricsBatcher {
+	countOfBatchesOptsTmp := NewCounterOpts(countOfBatchesOpts, labelNames)
+	return &MetricsBatcher{
+		CountOfBatches: p.NewCounter(countOfBatchesOptsTmp),
+	}
+}
+
+func (m *MetricsBatcher) With(labelValues ...string) *MetricsBatcher {
+	return &MetricsBatcher{
+		CountOfBatches: m.CountOfBatches,
+		labels:         labelValues,
+	}
+}
+
+func (m *MetricsBatcher) Initialize() {
+	m.CountOfBatches.With(
+		m.LabelsForWith("reason", ReasonBatchFull)...,
+	).Add(0)
+	m.CountOfBatches.With(
+		m.LabelsForWith("reason", ReasonBatchTimeout)...,
+	).Add(0)
+}
+
+func (m *MetricsBatcher) LabelsForWith(labelValues ...string) []string {
 	result := make([]string, 0, len(m.labels)+len(labelValues))
 	result = append(result, labelValues...)
 	result = append(result, m.labels...)
@@ -418,6 +492,9 @@ var countTxsAllOpts = metrics.CounterOpts{
 	StatsdFormat: "%{#fqname}",
 }
 
+// sizeOfBatchOpts is a Counter, not an average: it accumulates the bytes of every decided batch
+// (proposal header, payload and metadata plus the commit signatures), so the mean batch size is
+// its rate divided by the rate of view_count_batch_all.
 var sizeOfBatchOpts = metrics.CounterOpts{
 	Namespace:    "consensus",
 	Subsystem:    "smartbft",
@@ -437,12 +514,26 @@ var latencyBatchProcessingOpts = metrics.HistogramOpts{
 	StatsdFormat: "%{#fqname}",
 }
 
+// latencyBatchSaveOpts measures the time Application.Deliver takes for a decided batch
+// (see Controller.Deliver), not the time it takes to persist a record to the WAL; the WAL
+// append latency is wal_latency_append in pkg/wal.
 var latencyBatchSaveOpts = metrics.HistogramOpts{
 	Namespace:    "consensus",
 	Subsystem:    "smartbft",
 	Name:         "view_latency_batch_save",
 	Help:         "An average time it takes to persist batch.",
 	Buckets:      []float64{0.005, 0.01, 0.015, 0.05, 0.1, 1, 10},
+	LabelNames:   []string{},
+	StatsdFormat: "%{#fqname}",
+}
+
+// inFlightProposalsOpts is the number of proposals this node has pre-prepared (sent a prepare for)
+// and not yet delivered. With a single proposal in flight at a time it is 0 or 1.
+var inFlightProposalsOpts = metrics.GaugeOpts{
+	Namespace:    "consensus",
+	Subsystem:    "smartbft",
+	Name:         "view_in_flight_proposals",
+	Help:         "Number of proposals pre-prepared and not yet delivered.",
 	LabelNames:   []string{},
 	StatsdFormat: "%{#fqname}",
 }
@@ -460,6 +551,7 @@ type MetricsView struct {
 	SizeOfBatch            metrics.Counter
 	LatencyBatchProcessing metrics.Histogram
 	LatencyBatchSave       metrics.Histogram
+	InFlightProposals      metrics.Gauge
 }
 
 // NewMetricsView create new view metrics
@@ -475,6 +567,7 @@ func NewMetricsView(p metrics.Provider, labelNames ...string) *MetricsView {
 	sizeOfBatchOptsTmp := NewCounterOpts(sizeOfBatchOpts, labelNames)
 	latencyBatchProcessingOptsTmp := NewHistogramOpts(latencyBatchProcessingOpts, labelNames)
 	latencyBatchSaveOptsTmp := NewHistogramOpts(latencyBatchSaveOpts, labelNames)
+	inFlightProposalsOptsTmp := NewGaugeOpts(inFlightProposalsOpts, labelNames)
 	return &MetricsView{
 		ViewNumber:             p.NewGauge(viewNumberOptsTmp),
 		LeaderID:               p.NewGauge(leaderIDOptsTmp),
@@ -487,6 +580,7 @@ func NewMetricsView(p metrics.Provider, labelNames ...string) *MetricsView {
 		SizeOfBatch:            p.NewCounter(sizeOfBatchOptsTmp),
 		LatencyBatchProcessing: p.NewHistogram(latencyBatchProcessingOptsTmp),
 		LatencyBatchSave:       p.NewHistogram(latencyBatchSaveOptsTmp),
+		InFlightProposals:      p.NewGauge(inFlightProposalsOptsTmp),
 	}
 }
 
@@ -503,6 +597,7 @@ func (m *MetricsView) With(labelValues ...string) *MetricsView {
 		SizeOfBatch:            m.SizeOfBatch.With(labelValues...),
 		LatencyBatchProcessing: m.LatencyBatchProcessing.With(labelValues...),
 		LatencyBatchSave:       m.LatencyBatchSave.With(labelValues...),
+		InFlightProposals:      m.InFlightProposals.With(labelValues...),
 	}
 }
 
@@ -518,6 +613,7 @@ func (m *MetricsView) Initialize() {
 	m.SizeOfBatch.Add(0)
 	m.LatencyBatchProcessing.Observe(0)
 	m.LatencyBatchSave.Observe(0)
+	m.InFlightProposals.Add(0)
 }
 
 var currentViewOpts = metrics.GaugeOpts{

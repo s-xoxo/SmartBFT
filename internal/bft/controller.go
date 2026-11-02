@@ -999,6 +999,8 @@ func (med *MutuallyExclusiveDeliver) Deliver(proposal types.Proposal, signature 
 		}
 	}
 
+	// view_latency_batch_save measures the Application.Deliver call, i.e. the time the application
+	// takes to commit the decided batch, not the time it takes to persist a record to the WAL.
 	begin := time.Now()
 	result := med.C.Application.Deliver(proposal, signature)
 	med.C.MetricsView.LatencyBatchSave.Observe(time.Since(begin).Seconds())

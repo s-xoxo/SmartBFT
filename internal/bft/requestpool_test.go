@@ -17,6 +17,7 @@ import (
 
 	"github.com/hyperledger/SmartBFT/internal/bft"
 	"github.com/hyperledger/SmartBFT/internal/bft/mocks"
+	"github.com/hyperledger/SmartBFT/pkg/api"
 	"github.com/hyperledger/SmartBFT/pkg/types"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
@@ -634,4 +635,42 @@ func (ins *testRequestInspector) RequestID(req []byte) types.RequestInfo {
 	var info types.RequestInfo
 	info.ClientID, info.ID, _ = parseTestRequest(req)
 	return info
+}
+
+// TestReqPoolSizeBytesMetric makes sure the pool reports the total size in bytes of the requests it holds.
+func TestReqPoolSizeBytesMetric(t *testing.T) {
+	basicLog, err := zap.NewDevelopment()
+	require.NoError(t, err)
+	log := basicLog.Sugar()
+	insp := &testRequestInspector{}
+	recorder := &metricsRecorder{}
+	sizeBytes := func() float64 { return recorder.gauge("pool_size_bytes_of_elements") }
+
+	byteReq1 := makeTestRequest("1", "1", "foo")
+	byteReq2 := makeTestRequest("2", "2", "foo-bar-foo-bar")
+
+	pool := bft.NewPool(log, insp, noopTimeoutHandler, bft.PoolOptions{
+		QueueSize:      3,
+		ForwardTimeout: time.Hour,
+		Metrics:        api.NewMetricsRequestPool(recorder),
+	}, make(chan struct{}, 1))
+	defer pool.Close()
+
+	require.Zero(t, sizeBytes())
+
+	require.NoError(t, pool.Submit(byteReq1))
+	require.InDelta(t, float64(len(byteReq1)), sizeBytes(), 0)
+
+	require.NoError(t, pool.Submit(byteReq2))
+	require.InDelta(t, float64(len(byteReq1)+len(byteReq2)), sizeBytes(), 0)
+
+	// A request that is already in the pool does not change the size.
+	require.ErrorIs(t, pool.Submit(byteReq1), bft.ErrReqAlreadyExists)
+	require.InDelta(t, float64(len(byteReq1)+len(byteReq2)), sizeBytes(), 0)
+
+	require.NoError(t, pool.RemoveRequest(types.RequestInfo{ID: "1", ClientID: "1"}))
+	require.InDelta(t, float64(len(byteReq2)), sizeBytes(), 0)
+
+	require.NoError(t, pool.RemoveRequest(types.RequestInfo{ID: "2", ClientID: "2"}))
+	require.Zero(t, sizeBytes())
 }
