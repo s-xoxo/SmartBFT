@@ -444,7 +444,20 @@ type AppRecord struct {
 	Metadata []byte
 }
 
+// newNode creates a node running fastConfig with the given leader rotation settings.
 func newNode(id uint64, network *Network, testName string, testDir string, rotateLeader bool, decisionsPerLeader uint64) *App {
+	config := fastConfig
+	config.SyncOnStart = true
+	config.LeaderRotation = rotateLeader
+	config.DecisionsPerLeader = decisionsPerLeader
+	return newNodeWithConfig(id, network, testName, testDir, config)
+}
+
+// newNodeWithConfig creates a node running the given configuration verbatim (only SelfID is overridden with id),
+// so a test can start from fastConfig and set e.g. short timers or PipelineDepthMax before the node is created.
+// The configuration the node runs with (a.Consensus.Config, including changes made to it afterwards) is carried
+// over by Restart.
+func newNodeWithConfig(id uint64, network *Network, testName string, testDir string, cfg types.Configuration) *App {
 	logConfig := zap.NewDevelopmentConfig()
 	logger, _ := logConfig.Build()
 	logger = logger.With(zap.String("t", testName)).With(zap.Int64("id", int64(id)))
@@ -462,11 +475,8 @@ func newNode(id uint64, network *Network, testName string, testDir string, rotat
 		metricsProvider: &disabled.Provider{},
 	}
 
-	config := fastConfig
+	config := cfg
 	config.SelfID = id
-	config.SyncOnStart = true
-	config.LeaderRotation = rotateLeader
-	config.DecisionsPerLeader = decisionsPerLeader
 
 	app.Setup = func() {
 		writeAheadLog, walInitialEntries, err := wal.InitializeAndReadAll(
@@ -479,8 +489,9 @@ func newNode(id uint64, network *Network, testName string, testDir string, rotat
 		}
 
 		if app.Consensus != nil {
-			config.DecisionsPerLeader = app.Consensus.Config.DecisionsPerLeader
-			config.LeaderRotation = app.Consensus.Config.LeaderRotation
+			// A restarted node keeps the whole configuration it was running with, including fields a test
+			// changed in place (e.g. DecisionsPerLeader/LeaderRotation) or a reconfig replaced.
+			config = app.Consensus.Config
 		}
 
 		c := &consensus.Consensus{

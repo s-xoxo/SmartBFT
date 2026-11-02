@@ -28,6 +28,8 @@ type Configuration struct {
 	DecisionsPerLeader            int64
 	RequestMaxBytes               int64
 	RequestPoolSubmitTimeout      time.Duration
+	PipelineDepthMax              int64
+	AdaptiveBatch                 bool
 }
 
 type Reconfig struct {
@@ -62,6 +64,8 @@ func (r Reconfig) recconfigToUint(id uint64) types.Reconfig {
 			DecisionsPerLeader:            uint64(r.CurrentConfig.DecisionsPerLeader),
 			RequestMaxBytes:               uint64(r.CurrentConfig.RequestBatchMaxBytes),
 			RequestPoolSubmitTimeout:      r.CurrentConfig.RequestPoolSubmitTimeout,
+			PipelineDepthMax:              uint64(r.CurrentConfig.PipelineDepthMax),
+			AdaptiveBatch:                 r.CurrentConfig.AdaptiveBatch,
 		},
 	}
 }
@@ -91,6 +95,8 @@ func recconfigToInt(reconfig types.Reconfig) Reconfig {
 			DecisionsPerLeader:            int64(reconfig.CurrentConfig.DecisionsPerLeader),
 			RequestMaxBytes:               int64(reconfig.CurrentConfig.RequestBatchMaxBytes),
 			RequestPoolSubmitTimeout:      reconfig.CurrentConfig.RequestPoolSubmitTimeout,
+			PipelineDepthMax:              int64(reconfig.CurrentConfig.PipelineDepthMax),
+			AdaptiveBatch:                 reconfig.CurrentConfig.AdaptiveBatch,
 		},
 	}
 }
