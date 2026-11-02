@@ -532,3 +532,14 @@ func newNodeWithConfig(id uint64, network *Network, testName string, testDir str
 	app.Node = network.GetByID(id)
 	return app
 }
+
+// TryRestart restarts the node like Restart, but returns the error Consensus.Start returns instead of panicking
+// on it, for tests that expect the start to be refused. A node whose start was refused holds a consensus that
+// never started; such a test replaces its handler in the network before the network shuts down.
+func (a *App) TryRestart() error {
+	a.Consensus.Stop()
+	a.Node.Lock()
+	defer a.Node.Unlock()
+	a.Setup()
+	return a.Consensus.Start()
+}

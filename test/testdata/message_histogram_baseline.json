@@ -1,0 +1,113 @@
+{
+  "runs": 5,
+  "scenarios": {
+    "basic": {
+      "commit": {
+        "min": 12,
+        "max": 12
+      },
+      "commit_assist": {
+        "min": 0,
+        "max": 3
+      },
+      "heart_beat": {
+        "min": 0,
+        "max": 0
+      },
+      "heart_beat_response": {
+        "min": 0,
+        "max": 0
+      },
+      "new_view": {
+        "min": 0,
+        "max": 0
+      },
+      "other": {
+        "min": 0,
+        "max": 0
+      },
+      "pre_prepare": {
+        "min": 3,
+        "max": 3
+      },
+      "prepare": {
+        "min": 12,
+        "max": 12
+      },
+      "prepare_assist": {
+        "min": 0,
+        "max": 0
+      },
+      "state_transfer_request": {
+        "min": 12,
+        "max": 12
+      },
+      "state_transfer_response": {
+        "min": 12,
+        "max": 12
+      },
+      "view_change": {
+        "min": 0,
+        "max": 0
+      },
+      "view_data": {
+        "min": 0,
+        "max": 0
+      }
+    },
+    "in_flight_then_view_change": {
+      "commit": {
+        "min": 48,
+        "max": 48
+      },
+      "commit_assist": {
+        "min": 0,
+        "max": 0
+      },
+      "heart_beat": {
+        "min": 51,
+        "max": 54
+      },
+      "heart_beat_response": {
+        "min": 0,
+        "max": 0
+      },
+      "new_view": {
+        "min": 6,
+        "max": 6
+      },
+      "other": {
+        "min": 0,
+        "max": 0
+      },
+      "pre_prepare": {
+        "min": 12,
+        "max": 12
+      },
+      "prepare": {
+        "min": 39,
+        "max": 39
+      },
+      "prepare_assist": {
+        "min": 0,
+        "max": 0
+      },
+      "state_transfer_request": {
+        "min": 15,
+        "max": 15
+      },
+      "state_transfer_response": {
+        "min": 14,
+        "max": 14
+      },
+      "view_change": {
+        "min": 54,
+        "max": 57
+      },
+      "view_data": {
+        "min": 4,
+        "max": 4
+      }
+    }
+  }
+}
