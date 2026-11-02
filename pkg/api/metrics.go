@@ -17,6 +17,18 @@ const (
 	ReasonBatchFull = "FULL"
 	// ReasonBatchTimeout labels a batch that was returned because the batch timeout expired before it got full.
 	ReasonBatchTimeout = "TIMEOUT"
+
+	// BatchParamCount and BatchParamTimeout label an adaptive batch adjustment by the parameter it changed.
+	BatchParamCount   = "COUNT"
+	BatchParamTimeout = "TIMEOUT"
+	// DirectionUp and DirectionDown label an adaptive batch adjustment by its direction.
+	DirectionUp   = "UP"
+	DirectionDown = "DOWN"
+	// GuardDrain labels a trip of the request-age guard: a request waited too long in the leader's pool,
+	// so the batcher switched to maximal throughput. GuardLatency labels a trip of the round-latency guard:
+	// the leader's propose-to-decide latency rose well above its recent minimum, so the batch count was reduced.
+	GuardDrain   = "DRAIN"
+	GuardLatency = "LATENCY"
 )
 
 func NewGaugeOpts(old metrics.GaugeOpts, labelNames []string) metrics.GaugeOpts {
@@ -297,11 +309,35 @@ var batcherTimeoutSecondsOpts = metrics.GaugeOpts{
 	StatsdFormat: "%{#fqname}",
 }
 
+// batcherCountOfAdjustmentsOpts counts the adaptive batch adjustments, by the parameter that changed
+// (COUNT or TIMEOUT) and the direction (UP or DOWN). Only knobs whose value actually changed are counted.
+var batcherCountOfAdjustmentsOpts = metrics.CounterOpts{
+	Namespace:    "consensus",
+	Subsystem:    "smartbft",
+	Name:         "batcher_count_of_adjustments",
+	Help:         "Number of adaptive batch parameter adjustments, by parameter and direction.",
+	LabelNames:   []string{"param", "direction"},
+	StatsdFormat: "%{#fqname}.%{param}.%{direction}",
+}
+
+// batcherCountOfGuardTripsOpts counts how often an adaptive batch guard overrode the regular rules,
+// by the guard (DRAIN: a request waited too long in the leader's pool; LATENCY: round latency inflated).
+var batcherCountOfGuardTripsOpts = metrics.CounterOpts{
+	Namespace:    "consensus",
+	Subsystem:    "smartbft",
+	Name:         "batcher_count_of_guard_trips",
+	Help:         "Number of times an adaptive batch guard fired, by reason.",
+	LabelNames:   []string{"reason"},
+	StatsdFormat: "%{#fqname}.%{reason}",
+}
+
 // MetricsBatcher encapsulates batcher metrics
 type MetricsBatcher struct {
-	CountOfBatches metrics.Counter
-	MaxCount       metrics.Gauge
-	TimeoutSeconds metrics.Gauge
+	CountOfBatches     metrics.Counter
+	MaxCount           metrics.Gauge
+	TimeoutSeconds     metrics.Gauge
+	CountOfAdjustments metrics.Counter
+	CountOfGuardTrips  metrics.Counter
 
 	labels []string
 }
@@ -311,19 +347,25 @@ func NewMetricsBatcher(p metrics.Provider, labelNames ...string) *MetricsBatcher
 	countOfBatchesOptsTmp := NewCounterOpts(countOfBatchesOpts, labelNames)
 	batcherMaxCountOptsTmp := NewGaugeOpts(batcherMaxCountOpts, labelNames)
 	batcherTimeoutSecondsOptsTmp := NewGaugeOpts(batcherTimeoutSecondsOpts, labelNames)
+	batcherCountOfAdjustmentsOptsTmp := NewCounterOpts(batcherCountOfAdjustmentsOpts, labelNames)
+	batcherCountOfGuardTripsOptsTmp := NewCounterOpts(batcherCountOfGuardTripsOpts, labelNames)
 	return &MetricsBatcher{
-		CountOfBatches: p.NewCounter(countOfBatchesOptsTmp),
-		MaxCount:       p.NewGauge(batcherMaxCountOptsTmp),
-		TimeoutSeconds: p.NewGauge(batcherTimeoutSecondsOptsTmp),
+		CountOfBatches:     p.NewCounter(countOfBatchesOptsTmp),
+		MaxCount:           p.NewGauge(batcherMaxCountOptsTmp),
+		TimeoutSeconds:     p.NewGauge(batcherTimeoutSecondsOptsTmp),
+		CountOfAdjustments: p.NewCounter(batcherCountOfAdjustmentsOptsTmp),
+		CountOfGuardTrips:  p.NewCounter(batcherCountOfGuardTripsOptsTmp),
 	}
 }
 
 func (m *MetricsBatcher) With(labelValues ...string) *MetricsBatcher {
 	return &MetricsBatcher{
-		CountOfBatches: m.CountOfBatches,
-		MaxCount:       m.MaxCount.With(labelValues...),
-		TimeoutSeconds: m.TimeoutSeconds.With(labelValues...),
-		labels:         labelValues,
+		CountOfBatches:     m.CountOfBatches,
+		MaxCount:           m.MaxCount.With(labelValues...),
+		TimeoutSeconds:     m.TimeoutSeconds.With(labelValues...),
+		CountOfAdjustments: m.CountOfAdjustments,
+		CountOfGuardTrips:  m.CountOfGuardTrips,
+		labels:             labelValues,
 	}
 }
 
@@ -336,6 +378,19 @@ func (m *MetricsBatcher) Initialize() {
 	).Add(0)
 	m.MaxCount.Add(0)
 	m.TimeoutSeconds.Add(0)
+	for _, param := range []string{BatchParamCount, BatchParamTimeout} {
+		for _, direction := range []string{DirectionUp, DirectionDown} {
+			m.CountOfAdjustments.With(
+				m.LabelsForWith("param", param, "direction", direction)...,
+			).Add(0)
+		}
+	}
+	m.CountOfGuardTrips.With(
+		m.LabelsForWith("reason", GuardDrain)...,
+	).Add(0)
+	m.CountOfGuardTrips.With(
+		m.LabelsForWith("reason", GuardLatency)...,
+	).Add(0)
 }
 
 func (m *MetricsBatcher) LabelsForWith(labelValues ...string) []string {
