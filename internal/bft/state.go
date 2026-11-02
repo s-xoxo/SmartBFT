@@ -63,7 +63,8 @@ func (ps *PersistedState) storeProposal(proposed *protos.ProposedRecord) {
 		Payload:              proposal.GetPayload(),
 		Metadata:             proposal.GetMetadata(),
 	}
-	ps.InFlightProposal.StoreProposal(proposalToStore)
+	// Keyed by the pre-prepare's sequence, the one the commit that may follow it carries.
+	ps.InFlightProposal.StoreProposalAt(proposed.GetPrePrepare().GetSeq(), proposalToStore)
 }
 
 func (ps *PersistedState) storePrepared(commitMsg *protos.Message) {

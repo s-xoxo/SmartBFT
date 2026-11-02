@@ -544,6 +544,8 @@ func (c *Controller) decide(d decision) {
 	}
 	c.Logger.Debugf("Node %d delivered proposal", c.ID)
 	c.removeDeliveredFromPool(d)
+	// The delivered proposal is no longer in flight; with a single entry in flight this keeps it (see pruneDelivered).
+	c.InFlight.pruneDelivered(proposalSequenceOf(d.proposal))
 	close(d.delivered)
 	if c.stopped() {
 		return
@@ -579,13 +581,21 @@ func (c *Controller) decide(d decision) {
 		c.Logger.Panicf("Failed to unmarshal proposal metadata, error: %v", err)
 	}
 
+	rotated := false
 	if c.checkIfRotate(md.GetBlackList()) {
 		c.Logger.Debugf("Restarting view to rotate the leader")
 		c.changeView(c.getCurrentViewNumber(), md.GetLatestSequence()+1, c.getCurrentDecisionsInView())
 		c.Logger.Debugf("Restarting timers in request pool due to leader rotation")
 		c.RequestPool.RestartTimers()
+		rotated = true
 	}
 	c.MaybePruneRevokedRequests()
+	if rotated {
+		// The view that was just started issued the leader tokens of the new leader (R1), so a decision of the
+		// previous view does not return one (R4): with a single token the channel was full and the attempt failed
+		// anyway, with several tokens it would exceed the pipeline depth.
+		return
+	}
 	if iAm, _ := c.iAmTheLeader(); iAm {
 		if c.BatchTuner != nil {
 			// The delivered requests are out of the pool; adjust the parameters the next NextBatch call reads.
@@ -720,6 +730,7 @@ func (c *Controller) sync() (viewNum uint64, seq uint64, decisions uint64) {
 }
 
 func (c *Controller) maybePruneInFlight(syncResultViewMD *protos.ViewMetadata) {
+	// The lowest in-flight proposal; the ones above it are pruned with it when they are stale too.
 	inFlight := c.InFlight.InFlightProposal()
 	if inFlight == nil {
 		c.Logger.Debugf("No in-flight proposal to prune")
@@ -739,9 +750,19 @@ func (c *Controller) maybePruneInFlight(syncResultViewMD *protos.ViewMetadata) {
 	}
 	// Else we have replicated the in-flight proposal from another node or have committed it in the past,
 	// so we whenever we participate in a view change there will be no need to present this in-flight
-	// as we have corresponding signatures on the proposal.
+	// as we have corresponding signatures on the proposal. In-flight proposals above the synced
+	// sequence, if any, may still be relevant and stay.
 	c.Logger.Infof("Synced to sequence %d, deleting in-flight as it is stale", syncResultViewMD.GetLatestSequence())
-	c.InFlight.clear()
+	c.InFlight.clearUpTo(syncResultViewMD.GetLatestSequence())
+}
+
+// proposalSequenceOf returns the sequence in the metadata of a proposal that is about to be, or was, delivered.
+func proposalSequenceOf(proposal types.Proposal) uint64 {
+	md := &protos.ViewMetadata{}
+	if err := proto.Unmarshal(proposal.Metadata, md); err != nil {
+		return 0
+	}
+	return md.GetLatestSequence()
 }
 
 func (c *Controller) fetchState() *types.ViewAndSeq {
