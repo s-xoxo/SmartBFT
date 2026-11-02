@@ -477,6 +477,7 @@ func newNodeWithConfig(id uint64, network *Network, testName string, testDir str
 
 	config := cfg
 	config.SelfID = id
+	var tunerConfig *consensus.TunerConfig
 
 	app.Setup = func() {
 		writeAheadLog, walInitialEntries, err := wal.InitializeAndReadAll(
@@ -492,10 +493,12 @@ func newNodeWithConfig(id uint64, network *Network, testName string, testDir str
 			// A restarted node keeps the whole configuration it was running with, including fields a test
 			// changed in place (e.g. DecisionsPerLeader/LeaderRotation) or a reconfig replaced.
 			config = app.Consensus.Config
+			tunerConfig = app.Consensus.BatchTunerConfig
 		}
 
 		c := &consensus.Consensus{
 			Config:             config,
+			BatchTunerConfig:   tunerConfig,
 			ViewChangerTicker:  app.secondClock.C,
 			Scheduler:          app.clock.C,
 			Logger:             app.logger,

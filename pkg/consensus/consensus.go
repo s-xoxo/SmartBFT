@@ -22,11 +22,20 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
+// TunerConfig holds the parameters of the adaptive batch control law (Config.AdaptiveBatch).
+// See BatchTunerConfig.
+type TunerConfig = algorithm.TunerConfig
+
 // Consensus submits requests to be total ordered,
 // and delivers to the application proposals by invoking Deliver() on it.
 // The proposals contain batches of requests assembled together by the Assembler.
 type Consensus struct {
-	Config             types.Configuration
+	Config types.Configuration
+	// BatchTunerConfig optionally overrides the adaptive batch control-law parameters that are derived from
+	// Config when Config.AdaptiveBatch is true; its zero fields keep the derived values, and the derived bounds
+	// (maximal count, maximal timeout) are never widened. nil uses the derived values. It is meant for tests and
+	// benchmarks and is ignored when AdaptiveBatch is false.
+	BatchTunerConfig   *TunerConfig
 	Application        bft.Application
 	Assembler          bft.Assembler
 	WAL                bft.WriteAheadLog
@@ -461,6 +470,15 @@ func (c *Consensus) continueCreateComponents() {
 	c.controller.RequestPool = c.Pool
 	c.controller.Batcher = batchBuilder
 	c.controller.LeaderMonitor = leaderMonitor
+	if c.Config.AdaptiveBatch {
+		// Every node gets a tuner (its lifetime is the controller's, so a reconfig rebuilds it with the new
+		// configuration); it only acts on the leader-only paths of the controller.
+		tunerConfig := algorithm.TunerConfigFromConfiguration(c.Config)
+		if c.BatchTunerConfig != nil {
+			tunerConfig = tunerConfig.WithOverrides(*c.BatchTunerConfig)
+		}
+		c.controller.BatchTuner = algorithm.NewBatchTuner(tunerConfig, batchBuilder, c.Pool, c.Metrics.MetricsBatcher, c.Logger)
+	}
 
 	c.viewChanger.Controller = c.controller
 	c.viewChanger.Pruner = c.controller

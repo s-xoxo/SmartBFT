@@ -274,10 +274,177 @@ func TestLeaderPropose(t *testing.T) {
 		37: {Signer: 37, Value: []byte{4}},
 	}, signaturesBySigners)
 
+	// Without a BatchTuner (AdaptiveBatch off) the controller never touches the batch parameters.
+	batcher.AssertNotCalled(t, "SetBatchParams", mock.Anything)
+	batcher.AssertNotCalled(t, "BatchParams")
+
 	controller.Stop()
 	collector.Stop()
 	wal.Close()
 }
+
+// TestLeaderProposeDrivesBatchTuner runs the same round as TestLeaderPropose with a BatchTuner attached (AdaptiveBatch
+// on) and checks the three leader-only call points: Reset at startView publishes (CInit, T0), every proposal reads
+// the parameters NextBatch used, and the decision adjusts the count before the next proposal.
+func TestLeaderProposeDrivesBatchTuner(t *testing.T) {
+	basicLog, err := zap.NewDevelopment()
+	require.NoError(t, err)
+	log := basicLog.Sugar()
+	req := []byte{1}
+	batcher := &mocks.Batcher{}
+	batcher.On("Close")
+	batcher.On("Closed").Return(false)
+	batcher.On("NextBatch").Return([][]byte{req}).Once()
+	batcher.On("NextBatch").Return([][]byte{req}).Once()
+	initialParams := bft.BatchParams{MaxMsgCount: 1, MaxSizeBytes: 10 * 1024 * 1024, Timeout: 10 * time.Millisecond}
+	batcher.On("SetBatchParams", mock.Anything)
+	batcher.On("BatchParams").Return(initialParams)
+	verifier := &mocks.VerifierMock{}
+	verifier.On("VerifySignature", mock.Anything).Return(nil)
+	verifier.On("VerifyRequest", req).Return(types.RequestInfo{}, nil)
+	verifier.On("VerificationSequence").Return(uint64(1))
+	verifier.On("VerifyProposal", mock.Anything, mock.Anything).Return(nil, nil)
+	verifier.On("VerifyConsenterSig", mock.Anything, mock.Anything, mock.Anything).Return(nil, nil)
+	verifier.On("AuxiliaryData", mock.Anything).Return(bft.MarshalOrPanic(&protos.PreparesFrom{
+		Ids: []uint64{11, 23},
+	}))
+	assembler := &mocks.AssemblerMock{}
+	assembler.On("AssembleProposal", mock.Anything, [][]byte{req}).Return(proposal, [][]byte{}).Once()
+	secondProposal := proposal
+	secondProposal.Metadata = bft.MarshalOrPanic(&protos.ViewMetadata{
+		DecisionsInView: 1,
+		LatestSequence:  1,
+		ViewId:          1,
+	})
+	assembler.On("AssembleProposal", mock.Anything, [][]byte{req}).Return(secondProposal, [][]byte{}).Once()
+	comm := &mocks.CommMock{}
+	commWG := sync.WaitGroup{}
+	comm.On("SendConsensus", mock.Anything, mock.Anything).Run(func(args mock.Arguments) {
+		commWG.Done()
+	})
+	comm.On("Nodes").Return([]uint64{11, 17, 23, 37})
+	signer := &mocks.SignerMock{}
+	signer.On("Sign", mock.Anything).Return(nil)
+	signer.On("SignProposal", mock.Anything, mock.Anything).Return(&types.Signature{
+		ID:    17,
+		Value: []byte{4},
+	})
+	app := &mocks.ApplicationMock{}
+	appWG := sync.WaitGroup{}
+	app.On("Deliver", mock.Anything, mock.Anything).Run(func(args mock.Arguments) {
+		appWG.Done()
+	}).Return(types.Reconfig{InLatestDecision: false})
+	reqPool := &mocks.RequestPool{}
+	reqPool.On("Prune", mock.Anything)
+	reqPool.On("Close")
+	leaderMon := &mocks.LeaderMonitor{}
+	leaderMon.On("ChangeRole", bft.Leader, mock.Anything, mock.Anything)
+	leaderMon.On("HeartbeatWasSent")
+	leaderMon.On("Close")
+
+	testDir := t.TempDir()
+	wal, err := wal.Create(log, testDir, nil)
+	require.NoError(t, err)
+
+	synchronizer := &mocks.SynchronizerMock{}
+	synchronizer.On("Sync").Run(func(args mock.Arguments) {}).Return(types.SyncResponse{Latest: types.Decision{
+		Proposal:   types.Proposal{VerificationSequence: 0},
+		Signatures: nil,
+	}, Reconfig: types.ReconfigSync{InReplicatedDecisions: false}})
+
+	collector := bft.StateCollector{
+		SelfID:         11,
+		N:              4,
+		Logger:         log,
+		CollectTimeout: 100 * time.Millisecond,
+	}
+	collector.Start()
+
+	startedWG := sync.WaitGroup{}
+	startedWG.Add(1)
+
+	controller := &bft.Controller{
+		InFlight:      &bft.InFlightData{},
+		RequestPool:   reqPool,
+		LeaderMonitor: leaderMon,
+		WAL:           wal,
+		ID:            17, // the leader
+		N:             4,
+		NodesList:     []uint64{11, 17, 23, 37},
+		Logger:        log,
+		Batcher:       batcher,
+		Verifier:      verifier,
+		Assembler:     assembler,
+		Comm:          comm,
+		Signer:        signer,
+		Application:   app,
+		Checkpoint:    &types.Checkpoint{},
+		ViewChanger:   &bft.ViewChanger{},
+		Synchronizer:  synchronizer,
+		Collector:     &collector,
+		StartedWG:     &startedWG,
+		MetricsView:   api.NewMetricsView(&disabled.Provider{}),
+	}
+	controller.Deliver = &bft.MutuallyExclusiveDeliver{C: controller}
+
+	tunerConfig := bft.TunerConfigFromConfiguration(types.Configuration{
+		RequestBatchMaxCount:    10,
+		RequestBatchMaxBytes:    10 * 1024 * 1024,
+		RequestBatchMaxInterval: 10 * time.Millisecond,
+		RequestPoolSize:         40,
+		RequestForwardTimeout:   500 * time.Millisecond,
+	}).WithOverrides(bft.TunerConfig{K: 1, CInit: 1}) // one full decision with a backlog grows the count
+	controller.BatchTuner = bft.NewBatchTuner(tunerConfig, batcher, &staticPoolStats{size: 5}, nil, log)
+	batcher.AssertNumberOfCalls(t, "SetBatchParams", 1) // the constructor's Reset
+
+	configureProposerBuilder(controller)
+
+	commWG.Add(9)
+	controller.Start(1, 0, 0, 1, true)
+	commWG.Wait() // propose + state request
+
+	commWG.Add(3)
+	controller.ProcessMessages(23, prepare)
+	controller.ProcessMessages(37, prepare)
+	commWG.Wait()
+
+	commit23 := proto.Clone(commit2).(*protos.Message)
+	commit23Get := commit23.GetCommit()
+	commit23Get.Signature.Signer = 23
+	controller.ProcessMessages(23, commit23)
+	commit37 := proto.Clone(commit3).(*protos.Message)
+	commit37Get := commit37.GetCommit()
+	commit37Get.Signature.Signer = 37
+	appWG.Add(1)  // deliver
+	commWG.Add(6) // next proposal
+	controller.ProcessMessages(37, commit37)
+	appWG.Wait()
+	commWG.Wait()
+
+	controller.Stop()
+	app.AssertNumberOfCalls(t, "Deliver", 1)
+	leaderMon.AssertCalled(t, "HeartbeatWasSent")
+
+	// startView reset the tuner (CInit=1, T0), both proposals read the parameters, and the decision of a full
+	// batch with a backlog grew the count to 2 before the second proposal.
+	batcher.AssertCalled(t, "SetBatchParams", initialParams)
+	batcher.AssertCalled(t, "SetBatchParams", bft.BatchParams{MaxMsgCount: 2, MaxSizeBytes: 10 * 1024 * 1024, Timeout: 10 * time.Millisecond})
+	batcher.AssertNumberOfCalls(t, "SetBatchParams", 3)
+	batcher.AssertNumberOfCalls(t, "BatchParams", 2)
+
+	controller.Stop()
+	collector.Stop()
+	wal.Close()
+}
+
+// staticPoolStats reports a fixed backlog and oldest age to a BatchTuner.
+type staticPoolStats struct {
+	size int
+	age  time.Duration
+}
+
+func (p *staticPoolStats) Size() int                { return p.size }
+func (p *staticPoolStats) OldestAge() time.Duration { return p.age }
 
 func TestViewChanged(t *testing.T) {
 	basicLog, err := zap.NewDevelopment()
