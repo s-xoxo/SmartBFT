@@ -5,6 +5,7 @@
 package mocks
 
 import (
+	"github.com/hyperledger/SmartBFT/internal/bft"
 	mock "github.com/stretchr/testify/mock"
 )
 
@@ -42,6 +43,50 @@ type Batcher_Expecter struct {
 
 func (_m *Batcher) EXPECT() *Batcher_Expecter {
 	return &Batcher_Expecter{mock: &_m.Mock}
+}
+
+// BatchParams provides a mock function for the type Batcher
+func (_mock *Batcher) BatchParams() bft.BatchParams {
+	ret := _mock.Called()
+
+	if len(ret) == 0 {
+		panic("no return value specified for BatchParams")
+	}
+
+	var r0 bft.BatchParams
+	if returnFunc, ok := ret.Get(0).(func() bft.BatchParams); ok {
+		r0 = returnFunc()
+	} else {
+		r0 = ret.Get(0).(bft.BatchParams)
+	}
+	return r0
+}
+
+// Batcher_BatchParams_Call is a *mock.Call that shadows Run/Return methods with type explicit version for method 'BatchParams'
+type Batcher_BatchParams_Call struct {
+	*mock.Call
+}
+
+// BatchParams is a helper method to define mock.On call
+func (_e *Batcher_Expecter) BatchParams() *Batcher_BatchParams_Call {
+	return &Batcher_BatchParams_Call{Call: _e.mock.On("BatchParams")}
+}
+
+func (_c *Batcher_BatchParams_Call) Run(run func()) *Batcher_BatchParams_Call {
+	_c.Call.Run(func(args mock.Arguments) {
+		run()
+	})
+	return _c
+}
+
+func (_c *Batcher_BatchParams_Call) Return(batchParams bft.BatchParams) *Batcher_BatchParams_Call {
+	_c.Call.Return(batchParams)
+	return _c
+}
+
+func (_c *Batcher_BatchParams_Call) RunAndReturn(run func() bft.BatchParams) *Batcher_BatchParams_Call {
+	_c.Call.Return(run)
+	return _c
 }
 
 // Close provides a mock function for the type Batcher
@@ -196,6 +241,46 @@ func (_c *Batcher_Reset_Call) Return() *Batcher_Reset_Call {
 }
 
 func (_c *Batcher_Reset_Call) RunAndReturn(run func()) *Batcher_Reset_Call {
+	_c.Run(run)
+	return _c
+}
+
+// SetBatchParams provides a mock function for the type Batcher
+func (_mock *Batcher) SetBatchParams(batchParams bft.BatchParams) {
+	_mock.Called(batchParams)
+	return
+}
+
+// Batcher_SetBatchParams_Call is a *mock.Call that shadows Run/Return methods with type explicit version for method 'SetBatchParams'
+type Batcher_SetBatchParams_Call struct {
+	*mock.Call
+}
+
+// SetBatchParams is a helper method to define mock.On call
+//   - batchParams bft.BatchParams
+func (_e *Batcher_Expecter) SetBatchParams(batchParams any) *Batcher_SetBatchParams_Call {
+	return &Batcher_SetBatchParams_Call{Call: _e.mock.On("SetBatchParams", batchParams)}
+}
+
+func (_c *Batcher_SetBatchParams_Call) Run(run func(batchParams bft.BatchParams)) *Batcher_SetBatchParams_Call {
+	_c.Call.Run(func(args mock.Arguments) {
+		var arg0 bft.BatchParams
+		if args[0] != nil {
+			arg0 = args[0].(bft.BatchParams)
+		}
+		run(
+			arg0,
+		)
+	})
+	return _c
+}
+
+func (_c *Batcher_SetBatchParams_Call) Return() *Batcher_SetBatchParams_Call {
+	_c.Call.Return()
+	return _c
+}
+
+func (_c *Batcher_SetBatchParams_Call) RunAndReturn(run func(batchParams bft.BatchParams)) *Batcher_SetBatchParams_Call {
 	_c.Run(run)
 	return _c
 }

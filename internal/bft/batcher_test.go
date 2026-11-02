@@ -7,6 +7,7 @@ package bft_test
 
 import (
 	"strconv"
+	"sync"
 	"testing"
 	"time"
 
@@ -303,4 +304,159 @@ func TestBatcherCountsBatchesByReason(t *testing.T) {
 	batcher = bft.NewBatchBuilder(pool, submittedChan, 1, 2048, 10*time.Millisecond, nil)
 	require.Len(t, batcher.NextBatch(), 1)
 	require.InDelta(t, 3.0, full(), 0)
+}
+
+// TestBatchParamsDefaultsFromConstructor makes sure the constructor arguments are the parameters NextBatch reads,
+// and that the batcher reports them through the gauges.
+func TestBatchParamsDefaultsFromConstructor(t *testing.T) {
+	pool := &mocks.RequestPool{}
+	recorder := &metricsRecorder{}
+
+	batcher := bft.NewBatchBuilder(pool, make(chan struct{}, 1), 7, 2048, 10*time.Millisecond, api.NewMetricsBatcher(recorder))
+	require.Equal(t, bft.BatchParams{MaxMsgCount: 7, MaxSizeBytes: 2048, Timeout: 10 * time.Millisecond}, batcher.BatchParams())
+	require.InDelta(t, 7, recorder.gauge("batcher_max_count"), 0)
+	require.InDelta(t, 0.01, recorder.gauge("batcher_timeout_seconds"), 0)
+
+	batcher.SetBatchParams(bft.BatchParams{MaxMsgCount: 3, MaxSizeBytes: 4096, Timeout: 250 * time.Millisecond})
+	require.Equal(t, bft.BatchParams{MaxMsgCount: 3, MaxSizeBytes: 4096, Timeout: 250 * time.Millisecond}, batcher.BatchParams())
+	require.InDelta(t, 3, recorder.gauge("batcher_max_count"), 0)
+	require.InDelta(t, 0.25, recorder.gauge("batcher_timeout_seconds"), 0)
+}
+
+// TestSetBatchParamsNormalisesZero makes sure zero values cannot be published: a zero count or size becomes 1 and a
+// non-positive timeout keeps the previous timeout.
+func TestSetBatchParamsNormalisesZero(t *testing.T) {
+	pool := &mocks.RequestPool{}
+	batcher := bft.NewBatchBuilder(pool, make(chan struct{}, 1), 7, 2048, 10*time.Millisecond, nil)
+
+	batcher.SetBatchParams(bft.BatchParams{})
+	require.Equal(t, bft.BatchParams{MaxMsgCount: 1, MaxSizeBytes: 1, Timeout: 10 * time.Millisecond}, batcher.BatchParams())
+
+	batcher.SetBatchParams(bft.BatchParams{MaxMsgCount: 5, MaxSizeBytes: 100, Timeout: -time.Second})
+	require.Equal(t, bft.BatchParams{MaxMsgCount: 5, MaxSizeBytes: 100, Timeout: 10 * time.Millisecond}, batcher.BatchParams())
+}
+
+// TestSetBatchParamsAppliesToNextCall makes sure a NextBatch call that is in progress keeps the parameters it
+// started with, and that the next call reads the new ones.
+func TestSetBatchParamsAppliesToNextCall(t *testing.T) {
+	basicLog, err := zap.NewDevelopment()
+	require.NoError(t, err)
+	log := basicLog.Sugar()
+	insp := &testRequestInspector{}
+	submittedChan := make(chan struct{}, 1)
+	pool := bft.NewPool(log, insp, noopTimeoutHandler, bft.PoolOptions{QueueSize: 3}, submittedChan)
+	defer pool.Close()
+	require.NoError(t, pool.Submit(makeTestRequest("1", "1", "foo")))
+
+	// One request in the pool and a count of 10 with a one-minute timeout: the first call blocks.
+	entered := &enteredPool{RequestPool: pool, entered: make(chan struct{})}
+	batcher := bft.NewBatchBuilder(entered, submittedChan, 10, 2048, time.Minute, nil)
+	firstDone := make(chan [][]byte, 1)
+	go func() {
+		firstDone <- batcher.NextBatch()
+	}()
+	<-entered.entered // the first call has loaded its parameters
+
+	// Lowering the count while the first call waits does not wake it up; Close does.
+	batcher.SetBatchParams(bft.BatchParams{MaxMsgCount: 1, MaxSizeBytes: 2048, Timeout: 10 * time.Millisecond})
+	select {
+	case res := <-firstDone:
+		t.Fatalf("NextBatch in progress returned %d requests after SetBatchParams", len(res))
+	case <-time.After(50 * time.Millisecond):
+	}
+	batcher.Close()
+	select {
+	case res := <-firstDone:
+		require.Nil(t, res)
+	case <-time.After(10 * time.Second):
+		t.Fatal("NextBatch did not return after Close")
+	}
+
+	// The next call reads the new parameters: a count of 1 makes the single request a full batch at once.
+	batcher.Reset()
+	start := time.Now()
+	res := batcher.NextBatch()
+	require.Len(t, res, 1)
+	require.Less(t, time.Since(start), 10*time.Second)
+	require.Equal(t, bft.BatchParams{MaxMsgCount: 1, MaxSizeBytes: 2048, Timeout: 10 * time.Millisecond}, batcher.BatchParams())
+}
+
+// TestBatcherTimeoutUsesSnapshot makes sure the timeout of a NextBatch call in progress is the one it loaded when it
+// started, even if a shorter timeout is set while it waits.
+func TestBatcherTimeoutUsesSnapshot(t *testing.T) {
+	basicLog, err := zap.NewDevelopment()
+	require.NoError(t, err)
+	log := basicLog.Sugar()
+	insp := &testRequestInspector{}
+	submittedChan := make(chan struct{}, 1)
+	pool := bft.NewPool(log, insp, noopTimeoutHandler, bft.PoolOptions{QueueSize: 3}, submittedChan)
+	defer pool.Close()
+	require.NoError(t, pool.Submit(makeTestRequest("1", "1", "foo")))
+
+	batcher := bft.NewBatchBuilder(pool, submittedChan, 10, 2048, 200*time.Millisecond, nil)
+	start := time.Now()
+	done := make(chan [][]byte, 1)
+	go func() {
+		done <- batcher.NextBatch()
+	}()
+	time.Sleep(10 * time.Millisecond)
+	batcher.SetBatchParams(bft.BatchParams{MaxMsgCount: 10, MaxSizeBytes: 2048, Timeout: time.Millisecond})
+
+	res := <-done
+	require.Len(t, res, 1)
+	require.GreaterOrEqual(t, time.Since(start), 200*time.Millisecond)
+}
+
+// TestSetBatchParamsConcurrent makes sure concurrent writers and readers never see a mix of two parameter sets.
+// Every writer publishes sets whose three fields encode the same number, so a torn read would be detectable.
+func TestSetBatchParamsConcurrent(t *testing.T) {
+	pool := &mocks.RequestPool{}
+	batcher := bft.NewBatchBuilder(pool, make(chan struct{}, 1), 1, 1001, time.Millisecond, nil)
+
+	const writers, readers, rounds = 8, 8, 1000
+	var wg sync.WaitGroup
+	torn := make(chan bft.BatchParams, 1)
+	for w := range writers {
+		wg.Go(func() {
+			for i := 1; i <= rounds; i++ {
+				v := uint64(w*rounds + i)
+				batcher.SetBatchParams(bft.BatchParams{MaxMsgCount: v, MaxSizeBytes: 1000 + v, Timeout: time.Duration(v) * time.Millisecond})
+			}
+		})
+	}
+	for range readers {
+		wg.Go(func() {
+			for range rounds {
+				p := batcher.BatchParams()
+				v := p.MaxMsgCount
+				if p.MaxSizeBytes != 1000+v || p.Timeout != time.Duration(v)*time.Millisecond {
+					select {
+					case torn <- p:
+					default:
+					}
+				}
+			}
+		})
+	}
+	wg.Wait()
+	select {
+	case p := <-torn:
+		t.Fatalf("read a torn parameter set: %+v", p)
+	default:
+	}
+	p := batcher.BatchParams()
+	require.Equal(t, 1000+p.MaxMsgCount, p.MaxSizeBytes)
+}
+
+// enteredPool is a RequestPool that closes entered the first time NextRequests is called,
+// so a test knows a NextBatch call is in progress.
+type enteredPool struct {
+	bft.RequestPool
+	once    sync.Once
+	entered chan struct{}
+}
+
+func (p *enteredPool) NextRequests(maxCount int, maxSizeBytes uint64, check bool) ([][]byte, bool) {
+	p.once.Do(func() { close(p.entered) })
+	return p.RequestPool.NextRequests(maxCount, maxSizeBytes, check)
 }

@@ -32,6 +32,10 @@ type Batcher interface {
 	Close()
 	Closed() bool
 	Reset()
+	// SetBatchParams replaces the parameters the next NextBatch call reads.
+	SetBatchParams(BatchParams)
+	// BatchParams returns the parameters the next NextBatch call will read.
+	BatchParams() BatchParams
 }
 
 // RequestPool is a pool of client's requests
@@ -84,25 +88,28 @@ type Controller struct {
 	DecisionsPerLeader uint64
 	RequestPool        RequestPool
 	Batcher            Batcher
-	LeaderMonitor      LeaderMonitor
-	Verifier           api.Verifier
-	Logger             api.Logger
-	Assembler          api.Assembler
-	Application        api.Application
-	Deliver            api.Application
-	FailureDetector    FailureDetector
-	Synchronizer       api.Synchronizer
-	Signer             api.Signer
-	RequestInspector   api.RequestInspector
-	WAL                api.WriteAheadLog
-	ProposerBuilder    ProposerBuilder
-	Checkpoint         *types.Checkpoint
-	ViewChanger        *ViewChanger
-	Collector          *StateCollector
-	State              State
-	InFlight           *InFlightData
-	MetricsView        *api.MetricsView
-	quorum             int
+	// BatchTuner adjusts the Batcher's parameters from what the leader observes (AdaptiveBatch).
+	// nil (the default) leaves the batch parameters unchanged.
+	BatchTuner       *BatchTuner
+	LeaderMonitor    LeaderMonitor
+	Verifier         api.Verifier
+	Logger           api.Logger
+	Assembler        api.Assembler
+	Application      api.Application
+	Deliver          api.Application
+	FailureDetector  FailureDetector
+	Synchronizer     api.Synchronizer
+	Signer           api.Signer
+	RequestInspector api.RequestInspector
+	WAL              api.WriteAheadLog
+	ProposerBuilder  ProposerBuilder
+	Checkpoint       *types.Checkpoint
+	ViewChanger      *ViewChanger
+	Collector        *StateCollector
+	State            State
+	InFlight         *InFlightData
+	MetricsView      *api.MetricsView
+	quorum           int
 
 	currView Proposer
 
@@ -371,6 +378,11 @@ func (c *Controller) startView(proposalSequence uint64) {
 	role := Follower
 	leader, _ := c.iAmTheLeader()
 	if leader {
+		if c.BatchTuner != nil {
+			// A new view starts from the configured batch parameters: the samples gathered so far belong to
+			// another leader or to a view that was being changed.
+			c.BatchTuner.Reset()
+		}
 		if initPhase == COMMITTED || initPhase == ABORT {
 			c.Logger.Debugf("Acquiring leader token when starting view with phase %s", initPhase.String())
 			c.acquireLeaderToken()
@@ -466,8 +478,15 @@ func (c *Controller) propose() {
 	}
 	nextBatch := c.Batcher.NextBatch()
 	if len(nextBatch) == 0 { // no requests in this batch
+		if c.BatchTuner != nil {
+			c.BatchTuner.OnIdle()
+		}
 		c.acquireLeaderToken() // try again later
 		return
+	}
+	if c.BatchTuner != nil {
+		// The parameters NextBatch just used: only this goroutine changes them, right before the token is reacquired.
+		c.BatchTuner.OnBatch(nextBatch, c.Batcher.BatchParams())
 	}
 	metadata := c.currView.GetMetadata()
 	proposal := c.Assembler.AssembleProposal(metadata, nextBatch)
@@ -564,6 +583,10 @@ func (c *Controller) decide(d decision) {
 	}
 	c.MaybePruneRevokedRequests()
 	if iAm, _ := c.iAmTheLeader(); iAm {
+		if c.BatchTuner != nil {
+			// The delivered requests are out of the pool; adjust the parameters the next NextBatch call reads.
+			c.BatchTuner.OnDecision()
+		}
 		c.acquireLeaderToken()
 	}
 }

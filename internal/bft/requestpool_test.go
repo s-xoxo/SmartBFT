@@ -674,3 +674,90 @@ func TestReqPoolSizeBytesMetric(t *testing.T) {
 	require.NoError(t, pool.RemoveRequest(types.RequestInfo{ID: "2", ClientID: "2"}))
 	require.Zero(t, sizeBytes())
 }
+
+// TestReqPoolSizeGetters makes sure the lock-free Size and SizeBytes mirrors follow every addition and removal,
+// including Close, and that OldestAge reports the age of the request at the front of the queue.
+func TestReqPoolSizeGetters(t *testing.T) {
+	basicLog, err := zap.NewDevelopment()
+	require.NoError(t, err)
+	log := basicLog.Sugar()
+	insp := &testRequestInspector{}
+
+	byteReq1 := makeTestRequest("1", "1", "foo")
+	byteReq2 := makeTestRequest("2", "2", "foo-bar-foo-bar")
+
+	pool := bft.NewPool(log, insp, noopTimeoutHandler, bft.PoolOptions{QueueSize: 3, ForwardTimeout: time.Hour}, make(chan struct{}, 1))
+
+	require.Equal(t, 0, pool.Size())
+	require.Zero(t, pool.SizeBytes())
+	require.Zero(t, pool.OldestAge())
+
+	require.NoError(t, pool.Submit(byteReq1))
+	require.Equal(t, 1, pool.Size())
+	require.Equal(t, uint64(len(byteReq1)), pool.SizeBytes())
+	time.Sleep(20 * time.Millisecond)
+	age1 := pool.OldestAge()
+	require.GreaterOrEqual(t, age1, 20*time.Millisecond)
+
+	// The second request is younger; the oldest is still the first one.
+	require.NoError(t, pool.Submit(byteReq2))
+	require.Equal(t, 2, pool.Size())
+	require.Equal(t, uint64(len(byteReq1)+len(byteReq2)), pool.SizeBytes())
+	require.GreaterOrEqual(t, pool.OldestAge(), age1)
+
+	// A duplicate changes nothing.
+	require.ErrorIs(t, pool.Submit(byteReq1), bft.ErrReqAlreadyExists)
+	require.Equal(t, 2, pool.Size())
+	require.Equal(t, uint64(len(byteReq1)+len(byteReq2)), pool.SizeBytes())
+
+	// Removing the oldest makes the second one the front of the queue, which is younger.
+	require.NoError(t, pool.RemoveRequest(types.RequestInfo{ID: "1", ClientID: "1"}))
+	require.Equal(t, 1, pool.Size())
+	require.Equal(t, uint64(len(byteReq2)), pool.SizeBytes())
+	require.Less(t, pool.OldestAge(), age1)
+
+	// Removing a request that is not there changes nothing.
+	require.Error(t, pool.RemoveRequest(types.RequestInfo{ID: "1", ClientID: "1"}))
+	require.Equal(t, 1, pool.Size())
+
+	// Close empties the pool: the count mirror follows (bytes are not accounted by Close, as before).
+	pool.Close()
+	require.Equal(t, 0, pool.Size())
+	require.Zero(t, pool.OldestAge())
+}
+
+// TestReqPoolSizeMirrorUnderConcurrency makes sure the Size mirror agrees with the pool after concurrent
+// submissions and removals.
+func TestReqPoolSizeMirrorUnderConcurrency(t *testing.T) {
+	basicLog, err := zap.NewDevelopment()
+	require.NoError(t, err)
+	log := basicLog.Sugar()
+	insp := &testRequestInspector{}
+
+	pool := bft.NewPool(log, insp, noopTimeoutHandler, bft.PoolOptions{QueueSize: 1000, ForwardTimeout: time.Hour}, make(chan struct{}, 1))
+	defer pool.Close()
+
+	const workers, perWorker = 8, 100
+	var wg sync.WaitGroup
+	for w := range workers {
+		wg.Go(func() {
+			for i := range perWorker {
+				id := strconv.Itoa(w*perWorker + i)
+				require.NoError(t, pool.Submit(makeTestRequest(id, id, "foo")))
+				if i%2 == 0 {
+					require.NoError(t, pool.RemoveRequest(types.RequestInfo{ID: id, ClientID: id}))
+				}
+			}
+		})
+	}
+	wg.Wait()
+
+	require.Equal(t, workers*perWorker/2, pool.Size())
+	batch, _ := pool.NextRequests(workers*perWorker, 1<<30, false)
+	require.Len(t, batch, pool.Size())
+	var bytes uint64
+	for _, req := range batch {
+		bytes += uint64(len(req))
+	}
+	require.Equal(t, bytes, pool.SizeBytes())
+}
