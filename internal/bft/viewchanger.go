@@ -1353,7 +1353,7 @@ func (v *ViewChanger) commitInFlightProposal(proposal *protos.Proposal) (success
 	<-v.Ticker
 	<-v.Ticker
 
-	inFlightView.beginPrePrepare = time.Now() // the latency of processing the in flight proposal is measured from here
+	inFlightView.recordPrePrepareBegin(inFlightView.ProposalSequence) // the latency of processing the in flight proposal is measured from here
 	inFlightView.Start()
 	defer func() {
 		inFlightView.Abort()
