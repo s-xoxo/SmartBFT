@@ -176,3 +176,99 @@ func TestConfigurationValidate(t *testing.T) {
 		require.NoError(t, config.Validate())
 	})
 }
+
+func TestConfigurationValidatePipelineDepth(t *testing.T) {
+	validConfig := func() types.Configuration {
+		config := types.DefaultConfig
+		config.SelfID = 1
+		return config
+	}
+
+	t.Run("default config has depth one and adaptive batch off", func(t *testing.T) {
+		config := validConfig()
+		require.Equal(t, uint64(1), config.PipelineDepthMax)
+		require.False(t, config.AdaptiveBatch)
+		require.NoError(t, config.Validate())
+	})
+
+	t.Run("depth zero (unset) validates with rotation on", func(t *testing.T) {
+		config := validConfig()
+		config.PipelineDepthMax = 0
+		require.True(t, config.LeaderRotation)
+		require.NoError(t, config.Validate())
+	})
+
+	t.Run("depth one validates with rotation on", func(t *testing.T) {
+		config := validConfig()
+		config.PipelineDepthMax = 1
+		require.True(t, config.LeaderRotation)
+		require.NoError(t, config.Validate())
+	})
+
+	t.Run("depth two with rotation on fails", func(t *testing.T) {
+		config := validConfig()
+		config.PipelineDepthMax = 2
+		require.True(t, config.LeaderRotation)
+		require.EqualError(t, config.Validate(),
+			"PipelineDepthMax greater than one requires LeaderRotation to be off (and DecisionsPerLeader to be zero)")
+	})
+
+	t.Run("depth two with rotation off and big enough pool passes", func(t *testing.T) {
+		config := validConfig()
+		config.LeaderRotation = false
+		config.DecisionsPerLeader = 0
+		config.PipelineDepthMax = 2
+		require.Equal(t, uint64(100), config.RequestBatchMaxCount)
+		require.Equal(t, uint64(400), config.RequestPoolSize)
+		require.NoError(t, config.Validate())
+	})
+
+	t.Run("depth four exactly filling the pool passes", func(t *testing.T) {
+		config := validConfig()
+		config.LeaderRotation = false
+		config.DecisionsPerLeader = 0
+		config.PipelineDepthMax = 4 // 4 * 100 == 400
+		require.NoError(t, config.Validate())
+	})
+
+	t.Run("depth four with batch count times depth above pool fails", func(t *testing.T) {
+		config := validConfig()
+		config.LeaderRotation = false
+		config.DecisionsPerLeader = 0
+		config.PipelineDepthMax = 4
+		config.RequestPoolSize = 399 // 4 * 100 > 399
+		require.EqualError(t, config.Validate(),
+			"PipelineDepthMax times RequestBatchMaxCount is bigger than RequestPoolSize")
+	})
+
+	t.Run("huge depth does not overflow the pool check", func(t *testing.T) {
+		config := validConfig()
+		config.LeaderRotation = false
+		config.DecisionsPerLeader = 0
+		config.PipelineDepthMax = ^uint64(0)
+		require.EqualError(t, config.Validate(),
+			"PipelineDepthMax times RequestBatchMaxCount is bigger than RequestPoolSize")
+	})
+
+	t.Run("adaptive batch flag does not affect validation", func(t *testing.T) {
+		config := validConfig()
+		config.AdaptiveBatch = true
+		require.NoError(t, config.Validate())
+	})
+}
+
+func TestConfigurationEffectivePipelineDepth(t *testing.T) {
+	for _, tst := range []struct {
+		depth    uint64
+		expected uint64
+	}{
+		{depth: 0, expected: 1},
+		{depth: 1, expected: 1},
+		{depth: 2, expected: 2},
+		{depth: 7, expected: 7},
+	} {
+		config := types.Configuration{PipelineDepthMax: tst.depth}
+		require.Equal(t, tst.expected, config.EffectivePipelineDepth())
+	}
+	require.Equal(t, uint64(1), types.DefaultConfig.EffectivePipelineDepth())
+}
