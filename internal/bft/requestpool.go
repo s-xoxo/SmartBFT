@@ -71,6 +71,11 @@ type Pool struct {
 	// so that Size and SizeBytes can be read without taking the lock.
 	count atomic.Int64
 	bytes atomic.Uint64
+
+	// reservedCount and reservedBytes count the requests (and their bytes) that are reserved, i.e. that
+	// are part of a proposal in flight. They are a subset of existMap and sizeBytes, kept under the lock.
+	reservedCount int
+	reservedBytes uint64
 }
 
 // requestItem captures request related information
@@ -78,6 +83,10 @@ type requestItem struct {
 	request           []byte
 	timeout           *time.Timer
 	additionTimestamp time.Time
+	// reserved marks a request that is part of a proposal in flight: NextRequests skips it, so that it is not
+	// proposed twice while the pipeline holds more than one proposal. Its timers keep running, and it still
+	// counts in Size, because it still occupies the pool.
+	reserved bool
 }
 
 // PoolOptions is the pool configuration
@@ -320,18 +329,22 @@ func (rp *Pool) NextRequests(maxCount int, maxSizeBytes uint64, check bool) (bat
 	rp.lock.Lock()
 	defer rp.lock.Unlock()
 
+	// Reserved requests are part of a proposal in flight and are not available for a new batch.
 	if check {
-		if (len(rp.existMap) < maxCount) && (rp.sizeBytes < maxSizeBytes) {
+		if (len(rp.existMap)-rp.reservedCount < maxCount) && (rp.sizeBytes-rp.reservedBytes < maxSizeBytes) {
 			return nil, false
 		}
 	}
 
-	count := min(rp.fifo.Len(), maxCount)
+	count := min(rp.fifo.Len()-rp.reservedCount, maxCount)
 	var totalSize uint64
 	batch = make([][]byte, 0, count)
-	element := rp.fifo.Front()
-	for range count {
-		req := element.Value.(*requestItem).request
+	for element := rp.fifo.Front(); element != nil && len(batch) < count; element = element.Next() {
+		item := element.Value.(*requestItem)
+		if item.reserved {
+			continue
+		}
+		req := item.request
 		reqLen := uint64(len(req))
 		if totalSize+reqLen > maxSizeBytes {
 			rp.logger.Debugf("Returning batch of %d requests totalling %dB as it exceeds threshold of %dB",
@@ -340,7 +353,6 @@ func (rp *Pool) NextRequests(maxCount int, maxSizeBytes uint64, check bool) (bat
 		}
 		batch = append(batch, req)
 		totalSize += reqLen
-		element = element.Next()
 	}
 
 	fullS := totalSize >= maxSizeBytes
@@ -412,9 +424,53 @@ func (rp *Pool) RemoveRequest(requestInfo types.RequestInfo) error {
 	return nil
 }
 
+// Reserve marks the given requests as part of a proposal in flight, so that NextRequests does not return them
+// again until they are removed (delivered) or the reservations are released by UnreserveAll (a new view).
+// Requests that are not in the pool, or are already reserved, are ignored.
+func (rp *Pool) Reserve(requests []types.RequestInfo) {
+	rp.lock.Lock()
+	defer rp.lock.Unlock()
+
+	for _, requestInfo := range requests {
+		element, exist := rp.existMap[requestInfo]
+		if !exist {
+			continue
+		}
+		item := element.Value.(*requestItem)
+		if item.reserved {
+			continue
+		}
+		item.reserved = true
+		rp.reservedCount++
+		rp.reservedBytes += uint64(len(item.request))
+	}
+}
+
+// UnreserveAll releases every reservation. Reservations belong to the view that proposed the requests, so a
+// view that starts releases what the previous view left, and the requests are available to be proposed again.
+func (rp *Pool) UnreserveAll() {
+	rp.lock.Lock()
+	defer rp.lock.Unlock()
+
+	if rp.reservedCount == 0 {
+		return
+	}
+	for _, element := range rp.existMap {
+		element.Value.(*requestItem).reserved = false
+	}
+	rp.reservedCount = 0
+	rp.reservedBytes = 0
+}
+
 func (rp *Pool) deleteRequest(element *list.Element, requestInfo types.RequestInfo) {
 	item := element.Value.(*requestItem)
 	item.timeout.Stop()
+	if item.reserved {
+		// A removed request releases its reservation with it.
+		item.reserved = false
+		rp.reservedCount--
+		rp.reservedBytes -= uint64(len(item.request))
+	}
 
 	rp.fifo.Remove(element)
 	rp.count.Add(-1)

@@ -44,6 +44,10 @@ type RequestPool interface {
 	Submit(request []byte) error
 	Size() int
 	NextRequests(maxCount int, maxSizeBytes uint64, check bool) (batch [][]byte, full bool)
+	// Reserve marks requests that are part of a proposal in flight, so that NextRequests skips them.
+	Reserve(requests []types.RequestInfo)
+	// UnreserveAll releases every reservation; a view that starts calls it.
+	UnreserveAll()
 	RemoveRequest(request types.RequestInfo) error
 	StopTimers()
 	RestartTimers()
