@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/hyperledger/SmartBFT/pkg/api"
@@ -65,6 +66,11 @@ type Pool struct {
 	sizeBytes      uint64
 	delMap         map[types.RequestInfo]struct{}
 	delSlice       []types.RequestInfo
+
+	// count and bytes mirror len(existMap) and sizeBytes, updated under the lock at the same points,
+	// so that Size and SizeBytes can be read without taking the lock.
+	count atomic.Int64
+	bytes atomic.Uint64
 }
 
 // requestItem captures request related information
@@ -260,6 +266,7 @@ func (rp *Pool) Submit(request []byte) error {
 	}
 
 	element := rp.fifo.PushBack(reqItem)
+	rp.count.Add(1)
 	rp.metrics.CountOfRequestPool.Set(float64(rp.fifo.Len()))
 	rp.metrics.CountOfRequestPoolAll.Add(1)
 	rp.existMap[reqInfo] = element
@@ -277,17 +284,33 @@ func (rp *Pool) Submit(request []byte) error {
 	}
 
 	rp.sizeBytes += uint64(len(element.Value.(*requestItem).request))
+	rp.bytes.Store(rp.sizeBytes)
 	rp.metrics.SizeBytesOfRequestPool.Set(float64(rp.sizeBytes))
 
 	return nil
 }
 
-// Size returns the number of requests currently residing the pool
+// Size returns the number of requests currently residing the pool.
+// It reads a mirror of the count that is updated whenever a request is added or removed, without taking the lock.
 func (rp *Pool) Size() int {
-	rp.lock.Lock()
-	defer rp.lock.Unlock()
+	return int(rp.count.Load())
+}
 
-	return len(rp.existMap)
+// SizeBytes returns the total size in bytes of the requests currently residing the pool, without taking the lock.
+func (rp *Pool) SizeBytes() uint64 {
+	return rp.bytes.Load()
+}
+
+// OldestAge returns how long the oldest request in the pool has been waiting, or 0 if the pool is empty.
+func (rp *Pool) OldestAge() time.Duration {
+	rp.lock.RLock()
+	defer rp.lock.RUnlock()
+
+	front := rp.fifo.Front()
+	if front == nil {
+		return 0
+	}
+	return time.Since(front.Value.(*requestItem).additionTimestamp)
 }
 
 // NextRequests returns the next requests to be batched.
@@ -384,6 +407,7 @@ func (rp *Pool) RemoveRequest(requestInfo types.RequestInfo) error {
 
 	rp.deleteRequest(element, requestInfo)
 	rp.sizeBytes -= uint64(len(element.Value.(*requestItem).request))
+	rp.bytes.Store(rp.sizeBytes)
 	rp.metrics.SizeBytesOfRequestPool.Set(float64(rp.sizeBytes))
 	return nil
 }
@@ -393,6 +417,7 @@ func (rp *Pool) deleteRequest(element *list.Element, requestInfo types.RequestIn
 	item.timeout.Stop()
 
 	rp.fifo.Remove(element)
+	rp.count.Add(-1)
 	rp.metrics.CountOfRequestPool.Set(float64(rp.fifo.Len()))
 	rp.metrics.LatencyOfRequestPool.Observe(time.Since(item.additionTimestamp).Seconds())
 	delete(rp.existMap, requestInfo)
