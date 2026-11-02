@@ -83,6 +83,16 @@ type Configuration struct {
 	// RequestPoolSubmitTimeout the total amount of time a client can wait for the submission of a single
 	// request into the request pool.
 	RequestPoolSubmitTimeout time.Duration
+
+	// PipelineDepthMax is the maximum number of proposals a leader may have in flight at the same time.
+	// 0 or 1 preserve the original sequential behaviour (one proposal in flight per view); 0 means "unset"
+	// and is treated as 1 so that configurations created before this field existed keep validating.
+	// Values greater than 1 enable pipelining, which is not implemented yet: the field is plumbing only
+	// and currently affects nothing but Validate.
+	PipelineDepthMax uint64
+	// AdaptiveBatch, when true, allows the batcher to adjust the batch size and timeout at runtime.
+	// Not implemented yet: the field is plumbing only. The default (false) is the original behaviour.
+	AdaptiveBatch bool
 }
 
 // DefaultConfig contains reasonable values for a small cluster that resides on the same geography (or "Region"), but
@@ -110,6 +120,17 @@ var DefaultConfig = Configuration{
 	DecisionsPerLeader:            3,
 	RequestMaxBytes:               10 * 1024,
 	RequestPoolSubmitTimeout:      5 * time.Second,
+	PipelineDepthMax:              1,
+	AdaptiveBatch:                 false,
+}
+
+// EffectivePipelineDepth returns the pipeline depth that is actually in effect: PipelineDepthMax,
+// with 0 (unset) normalised to 1, the original sequential behaviour.
+func (c Configuration) EffectivePipelineDepth() uint64 {
+	if c.PipelineDepthMax == 0 {
+		return 1
+	}
+	return c.PipelineDepthMax
 }
 
 func (c Configuration) Validate() error {
@@ -184,6 +205,16 @@ func (c Configuration) Validate() error {
 	}
 	if c.RequestPoolSubmitTimeout <= 0 {
 		return errors.New("RequestPoolSubmitTimeout should be greater than zero")
+	}
+	// PipelineDepthMax of 0 means "unset" and is treated as 1 (the original behaviour), so it is never rejected.
+	if depth := c.EffectivePipelineDepth(); depth > 1 {
+		if c.LeaderRotation {
+			return errors.New("PipelineDepthMax greater than one requires LeaderRotation to be off (and DecisionsPerLeader to be zero)")
+		}
+		// Equivalent to depth*RequestBatchMaxCount > RequestPoolSize, written as a division so it cannot overflow.
+		if c.RequestBatchMaxCount > c.RequestPoolSize/depth {
+			return errors.New("PipelineDepthMax times RequestBatchMaxCount is bigger than RequestPoolSize")
+		}
 	}
 
 	return nil
