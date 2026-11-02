@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/hyperledger/SmartBFT/pkg/api"
 	"github.com/hyperledger/SmartBFT/pkg/types"
@@ -359,6 +360,10 @@ type ProposalMaker struct {
 	ViewSequences      *atomic.Value
 	restoreOnceFromWAL sync.Once
 	Checkpoint         *types.Checkpoint
+	// PipelineDepth is the number of proposals a view lets its leader have in flight (0 = 1, sequential).
+	PipelineDepth uint64
+	// PrePrepareResendInterval is how often the leader of a view with a depth above one resends its open pre-prepares.
+	PrePrepareResendInterval time.Duration
 }
 
 // NewProposer returns a new view
@@ -387,6 +392,9 @@ func (pm *ProposalMaker) NewProposer(leader, proposalSequence, viewNum, decision
 		ViewSequences:      pm.ViewSequences,
 		MetricsBlacklist:   pm.MetricsBlacklist,
 		MetricsView:        pm.MetricsView,
+
+		PipelineDepth:            pm.PipelineDepth,
+		PrePrepareResendInterval: pm.PrePrepareResendInterval,
 	}
 
 	view.ViewSequences.Store(ViewSequence{

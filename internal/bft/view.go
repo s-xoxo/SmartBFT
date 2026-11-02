@@ -101,6 +101,11 @@ type View struct {
 	// PipelineDepth is the number of proposals the leader may have in flight, W. 0 is treated as 1,
 	// the original sequential behaviour: one proposal in flight, the next proposed after delivery.
 	PipelineDepth uint64
+	// PrePrepareResendInterval is how often a leader with a pipeline depth above one broadcasts again the
+	// pre-prepares of the sequences it has not seen committed, so that a follower that missed one can prepare
+	// the sequences above it (the prefix rule). 0 disables it. With a depth of one nothing is ever resent:
+	// the sequential protocol sends every message once and recovers through sync.
+	PrePrepareResendInterval time.Duration
 	// Runtime
 	lastVotedProposalByID map[uint64]*protos.Commit
 	incMsgs               chan *incMsg
@@ -123,6 +128,10 @@ type View struct {
 	slots map[uint64]*seqState
 	// verifiedSigs receives the commit signatures the verification goroutines verified, tagged by sequence.
 	verifiedSigs chan verifiedSig
+	// resendTick fires when the leader should broadcast its open pre-prepares again. It is nil, and never
+	// fires, unless the depth is above one and this node leads the view (tests inject a channel).
+	resendTick   <-chan time.Time
+	resendTicker *time.Ticker
 
 	// prePrepareBegin records, per proposal sequence, when this node accepted the pre-prepare,
 	// so that view_latency_batch_processing is measured for the sequence that is committed.
@@ -219,6 +228,15 @@ func (v *View) expectedDecisions(seq uint64) uint64 {
 
 // Start starts the view
 func (v *View) Start() {
+	v.setup()
+
+	go func() {
+		v.run()
+	}()
+}
+
+// setup initialises the runtime state of the view, before its goroutine runs.
+func (v *View) setup() {
 	v.stopOnce = sync.Once{}
 	v.incMsgs = make(chan *incMsg, v.InMsgQSize)
 	v.abortChan = make(chan struct{})
@@ -246,9 +264,10 @@ func (v *View) Start() {
 		v.head = v.ProposalSequence + 1
 	}
 
-	go func() {
-		v.run()
-	}()
+	if v.resendTick == nil && v.depth() > 1 && v.SelfID == v.LeaderID && v.PrePrepareResendInterval > 0 {
+		v.resendTicker = time.NewTicker(v.PrePrepareResendInterval)
+		v.resendTick = v.resendTicker.C
+	}
 }
 
 // slot returns the state of the given sequence, creating it when it is the first message for that sequence:
@@ -371,6 +390,9 @@ func (v *View) run() {
 			ViewActive:  false,
 		})
 	}()
+	if v.resendTicker != nil {
+		defer v.resendTicker.Stop()
+	}
 	v.doPhase() // a restored proposal broadcasts its prepare or commit again right away
 	for {
 		select {
@@ -380,6 +402,8 @@ func (v *View) run() {
 			v.processMsg(msg.sender, msg.Message)
 		case vs := <-v.verifiedSigs:
 			v.acceptVerifiedSig(vs)
+		case <-v.resendTick: // nil, so never, unless the depth is above one and this node leads
+			v.resendPrePrepares()
 		}
 		if v.Stopped() {
 			return
@@ -473,6 +497,12 @@ func (v *View) storePrePrepare(slot *seqState, pp *protos.PrePrepare, m *protos.
 
 	if slot.prePrepare != nil || slot.phase != slotEmpty {
 		// A sequence accepts one pre-prepare only; a conflicting one is dropped, the first one wins.
+		if v.depth() > 1 && proto.Equal(slot.prePrepare, m) {
+			// The leader of a pipelined view broadcasts its open pre-prepares again periodically, so
+			// the same message is expected to arrive again; it is not worth a warning.
+			v.Logger.Debugf("Got the pre-prepare for sequence %d again, ignoring it", slot.seq)
+			return
+		}
 		currentOrNext := "current"
 		if slot.seq != v.ProposalSequence {
 			currentOrNext = "next"
@@ -491,6 +521,27 @@ func (v *View) acceptVerifiedSig(vs verifiedSig) {
 		return
 	}
 	slot.signatures = append(slot.signatures, vs.sig)
+}
+
+// resendPrePrepares broadcasts again the pre-prepares of the sequences this leader proposed and has not
+// seen committed, so that a follower that missed one fills the gap and prepares what is above it. A sequence
+// that is committed here was accepted by a quorum; a node that lacks it catches up through the previous
+// sequence messages or through sync, as it always did.
+func (v *View) resendPrePrepares() {
+	for seq := v.ProposalSequence; seq < v.head; seq++ {
+		slot := v.slots[seq]
+		if slot == nil || slot.prePrepare == nil || slot.phase >= slotCommitted {
+			continue
+		}
+		v.Comm.BroadcastConsensus(slot.prePrepare)
+	}
+}
+
+// inFlightCount returns how many sequences the leader proposed and has not delivered yet.
+func (v *View) inFlightCount() uint64 {
+	v.seqLock.Lock()
+	defer v.seqLock.Unlock()
+	return v.head - v.ProposalSequence
 }
 
 // onCommitQuorum marks a sequence as committed; tryDeliver delivers it once every lower sequence was delivered.
