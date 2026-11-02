@@ -32,6 +32,10 @@ type Batcher interface {
 	Close()
 	Closed() bool
 	Reset()
+	// SetBatchParams replaces the parameters the next NextBatch call reads.
+	SetBatchParams(BatchParams)
+	// BatchParams returns the parameters the next NextBatch call will read.
+	BatchParams() BatchParams
 }
 
 // RequestPool is a pool of client's requests

@@ -275,9 +275,33 @@ var countOfBatchesOpts = metrics.CounterOpts{
 	StatsdFormat: "%{#fqname}.%{reason}",
 }
 
+// batcherMaxCountOpts is the maximal number of requests in a batch the batcher currently uses.
+// It is the configured RequestBatchMaxCount unless adaptive batching changes it at runtime.
+var batcherMaxCountOpts = metrics.GaugeOpts{
+	Namespace:    "consensus",
+	Subsystem:    "smartbft",
+	Name:         "batcher_max_count",
+	Help:         "Maximal number of requests in a batch currently in effect.",
+	LabelNames:   []string{},
+	StatsdFormat: "%{#fqname}",
+}
+
+// batcherTimeoutSecondsOpts is the batch timeout the batcher currently uses, in seconds.
+// It is the configured RequestBatchMaxInterval unless adaptive batching changes it at runtime.
+var batcherTimeoutSecondsOpts = metrics.GaugeOpts{
+	Namespace:    "consensus",
+	Subsystem:    "smartbft",
+	Name:         "batcher_timeout_seconds",
+	Help:         "Batch timeout currently in effect, in seconds.",
+	LabelNames:   []string{},
+	StatsdFormat: "%{#fqname}",
+}
+
 // MetricsBatcher encapsulates batcher metrics
 type MetricsBatcher struct {
 	CountOfBatches metrics.Counter
+	MaxCount       metrics.Gauge
+	TimeoutSeconds metrics.Gauge
 
 	labels []string
 }
@@ -285,14 +309,20 @@ type MetricsBatcher struct {
 // NewMetricsBatcher create new batcher metrics
 func NewMetricsBatcher(p metrics.Provider, labelNames ...string) *MetricsBatcher {
 	countOfBatchesOptsTmp := NewCounterOpts(countOfBatchesOpts, labelNames)
+	batcherMaxCountOptsTmp := NewGaugeOpts(batcherMaxCountOpts, labelNames)
+	batcherTimeoutSecondsOptsTmp := NewGaugeOpts(batcherTimeoutSecondsOpts, labelNames)
 	return &MetricsBatcher{
 		CountOfBatches: p.NewCounter(countOfBatchesOptsTmp),
+		MaxCount:       p.NewGauge(batcherMaxCountOptsTmp),
+		TimeoutSeconds: p.NewGauge(batcherTimeoutSecondsOptsTmp),
 	}
 }
 
 func (m *MetricsBatcher) With(labelValues ...string) *MetricsBatcher {
 	return &MetricsBatcher{
 		CountOfBatches: m.CountOfBatches,
+		MaxCount:       m.MaxCount.With(labelValues...),
+		TimeoutSeconds: m.TimeoutSeconds.With(labelValues...),
 		labels:         labelValues,
 	}
 }
@@ -304,6 +334,8 @@ func (m *MetricsBatcher) Initialize() {
 	m.CountOfBatches.With(
 		m.LabelsForWith("reason", ReasonBatchTimeout)...,
 	).Add(0)
+	m.MaxCount.Add(0)
+	m.TimeoutSeconds.Add(0)
 }
 
 func (m *MetricsBatcher) LabelsForWith(labelValues ...string) []string {

@@ -30,11 +30,11 @@ func (p *metricsRecorder) NewCounter(opts metrics.CounterOpts) metrics.Counter {
 	return &recordedCounter{recorder: p, name: opts.Name}
 }
 
-// gauge returns the last value set on the gauge with the given name and label values.
-func (p *metricsRecorder) gauge(name string, labelValues ...string) float64 {
+// gauge returns the last value set on the unlabelled gauge with the given name.
+func (p *metricsRecorder) gauge(name string) float64 {
 	p.lock.Lock()
 	defer p.lock.Unlock()
-	return p.gauges[metricKey(name, labelValues)]
+	return p.gauges[metricKey(name, nil)]
 }
 
 // counter returns the sum added to the counter with the given name and label values.
