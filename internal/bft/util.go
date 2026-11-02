@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/hyperledger/SmartBFT/pkg/api"
 	"github.com/hyperledger/SmartBFT/pkg/types"
@@ -181,9 +182,15 @@ func computeQuorum(n uint64) (q int, f int) {
 
 // InFlightData records proposals that are in-flight,
 // as well as their corresponding prepares.
+//
+// With a pipeline depth above one several proposals are in flight at the same time, so the
+// entries are keyed by proposal sequence. The getters report the lowest sequence in flight:
+// the view change protocol recovers one proposal, the one with sequence maxLastDecision+1,
+// and that is the lowest undelivered sequence. With a single entry (the sequential case) the
+// getters return that entry, exactly as before.
 type InFlightData struct {
-	lock sync.RWMutex
-	v    *inFlightProposalData
+	lock    sync.RWMutex
+	entries map[uint64]*inFlightProposalData
 }
 
 type inFlightProposalData struct {
@@ -191,72 +198,145 @@ type inFlightProposalData struct {
 	prepared bool
 }
 
-// InFlightProposal returns an in-flight proposal or nil if there is no such.
+// lowest returns the entry with the lowest sequence, or nil if there is none. Call under the lock.
+func (ifp *InFlightData) lowest() *inFlightProposalData {
+	var (
+		lowestSeq uint64
+		lowest    *inFlightProposalData
+	)
+	for seq, entry := range ifp.entries {
+		if lowest == nil || seq < lowestSeq {
+			lowestSeq, lowest = seq, entry
+		}
+	}
+	return lowest
+}
+
+// InFlightProposal returns the in-flight proposal with the lowest sequence, or nil if there is no such.
 func (ifp *InFlightData) InFlightProposal() *types.Proposal {
 	ifp.lock.RLock()
 	defer ifp.lock.RUnlock()
 
-	if ifp.v == nil {
+	entry := ifp.lowest()
+	if entry == nil {
 		return nil
 	}
 
-	return ifp.v.proposal
+	return entry.proposal
 }
 
-// IsInFlightPrepared returns true if the in-flight proposal is prepared.
+// IsInFlightPrepared returns true if the in-flight proposal with the lowest sequence is prepared.
 func (ifp *InFlightData) IsInFlightPrepared() bool {
 	ifp.lock.RLock()
 	defer ifp.lock.RUnlock()
 
-	if ifp.v == nil {
+	entry := ifp.lowest()
+	if entry == nil {
 		return false
 	}
 
-	return ifp.v.prepared
+	return entry.prepared
 }
 
-// InFlightProposalAndPrepared returns the in-flight proposal, or nil if there is no such,
+// InFlightProposalAndPrepared returns the in-flight proposal with the lowest sequence, or nil if there is no such,
 // together with whether it is prepared, so that the two are never taken from different proposals.
 func (ifp *InFlightData) InFlightProposalAndPrepared() (*types.Proposal, bool) {
 	ifp.lock.RLock()
 	defer ifp.lock.RUnlock()
 
-	if ifp.v == nil {
+	entry := ifp.lowest()
+	if entry == nil {
 		return nil, false
 	}
 
-	return ifp.v.proposal, ifp.v.prepared
+	return entry.proposal, entry.prepared
 }
 
-// StoreProposal stores an in-flight proposal.
+// StoreProposal stores an in-flight proposal under the sequence in its metadata.
+// A proposal whose metadata cannot be unmarshaled is stored under sequence 0; on the
+// operational path the metadata was verified before the proposal is stored.
 func (ifp *InFlightData) StoreProposal(prop types.Proposal) {
-	p := prop
-
-	ifp.lock.Lock()
-	defer ifp.lock.Unlock()
-
-	ifp.v = &inFlightProposalData{proposal: &p}
+	md := &protos.ViewMetadata{}
+	if err := proto.Unmarshal(prop.Metadata, md); err != nil {
+		md = &protos.ViewMetadata{}
+	}
+	ifp.StoreProposalAt(md.GetLatestSequence(), prop)
 }
 
-// StorePrepares stores alongside the already stored in-flight proposal that it is prepared.
-func (ifp *InFlightData) StorePrepares(view, seq uint64) {
-	prop := ifp.InFlightProposal()
-	if prop == nil {
-		panic("stored prepares but proposal is not initialized")
-	}
+// StoreProposalAt stores an in-flight proposal under the given sequence, replacing an entry with that sequence.
+func (ifp *InFlightData) StoreProposalAt(seq uint64, prop types.Proposal) {
 	p := prop
 
 	ifp.lock.Lock()
 	defer ifp.lock.Unlock()
 
-	ifp.v = &inFlightProposalData{proposal: p, prepared: true}
+	if ifp.entries == nil {
+		ifp.entries = make(map[uint64]*inFlightProposalData)
+	}
+	ifp.entries[seq] = &inFlightProposalData{proposal: &p}
+}
+
+// StorePrepares stores alongside the already stored in-flight proposal of the given sequence that it is prepared.
+// When no proposal is stored under that sequence but exactly one proposal is in flight, that one is marked, as
+// it was when a single proposal was tracked (a proposal stored without metadata is under sequence 0).
+func (ifp *InFlightData) StorePrepares(view, seq uint64) {
+	ifp.lock.Lock()
+	defer ifp.lock.Unlock()
+
+	entry, exists := ifp.entries[seq]
+	if !exists {
+		if len(ifp.entries) != 1 {
+			panic("stored prepares but proposal is not initialized")
+		}
+		for s, only := range ifp.entries {
+			seq, entry = s, only
+		}
+	}
+
+	ifp.entries[seq] = &inFlightProposalData{proposal: entry.proposal, prepared: true}
 }
 
 func (ifp *InFlightData) clear() {
 	ifp.lock.Lock()
 	defer ifp.lock.Unlock()
 
-	ifp.v = nil
+	ifp.entries = nil
+}
+
+// clearUpTo forgets every in-flight proposal with a sequence up to and including the given one,
+// which was synced from the other nodes, so it is no longer in flight.
+func (ifp *InFlightData) clearUpTo(seq uint64) {
+	ifp.lock.Lock()
+	defer ifp.lock.Unlock()
+
+	for s := range ifp.entries {
+		if s <= seq {
+			delete(ifp.entries, s)
+		}
+	}
+}
+
+// pruneDelivered forgets the in-flight proposals with a sequence up to and including the delivered one,
+// except for the entry with the highest sequence, which stays even when it was delivered: the sequential
+// case keeps its single entry after delivery, so what a view data message carries is unchanged (a delivered
+// proposal is not reported as in flight anyway, only its prepared flag is carried). With several entries
+// the delivered ones go, so the lowest entry is the proposal that is actually in flight.
+func (ifp *InFlightData) pruneDelivered(seq uint64) {
+	if ifp == nil { // a controller built without in-flight data (tests)
+		return
+	}
+	ifp.lock.Lock()
+	defer ifp.lock.Unlock()
+
+	var highest uint64
+	for s := range ifp.entries {
+		highest = max(highest, s)
+	}
+	for s := range ifp.entries {
+		if s <= seq && s != highest {
+			delete(ifp.entries, s)
+		}
+	}
 }
 
 // ProposalMaker implements ProposerBuilder
@@ -280,6 +360,10 @@ type ProposalMaker struct {
 	ViewSequences      *atomic.Value
 	restoreOnceFromWAL sync.Once
 	Checkpoint         *types.Checkpoint
+	// PipelineDepth is the number of proposals a view lets its leader have in flight (0 = 1, sequential).
+	PipelineDepth uint64
+	// PrePrepareResendInterval is how often the leader of a view with a depth above one resends its open pre-prepares.
+	PrePrepareResendInterval time.Duration
 }
 
 // NewProposer returns a new view
@@ -308,6 +392,9 @@ func (pm *ProposalMaker) NewProposer(leader, proposalSequence, viewNum, decision
 		ViewSequences:      pm.ViewSequences,
 		MetricsBlacklist:   pm.MetricsBlacklist,
 		MetricsView:        pm.MetricsView,
+
+		PipelineDepth:            pm.PipelineDepth,
+		PrePrepareResendInterval: pm.PrePrepareResendInterval,
 	}
 
 	view.ViewSequences.Store(ViewSequence{

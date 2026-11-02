@@ -119,6 +119,15 @@ func (c *Consensus) Start() error {
 		return fmt.Errorf("configuration is invalid: %w", err)
 	}
 
+	// Restoring proposals in flight from the WAL is implemented for one proposal in flight only; with a
+	// deeper pipeline the restore would forget the other proposals in flight, so it is refused explicitly.
+	if depth := c.Config.EffectivePipelineDepth(); depth > 1 {
+		if seq, inFlight := algorithm.InFlightSequenceInWAL(c.WALInitialContent, c.Metadata.GetLatestSequence()); inFlight {
+			return fmt.Errorf("the WAL holds a proposal with sequence %d in flight, which cannot be restored with PipelineDepthMax %d: "+
+				"restarting with proposals in flight is supported only with a pipeline depth of one", seq, depth)
+		}
+	}
+
 	if c.Metrics == nil {
 		c.Metrics = bft.NewMetrics(&disabled.Provider{})
 	}
@@ -353,7 +362,19 @@ func (c *Consensus) proposalMaker() *algorithm.ProposalMaker {
 		NodesList:          c.nodes,
 		InMsqQSize:         int(c.Config.IncomingMessageBufferSize),
 		ViewSequences:      c.controller.ViewSequences,
+
+		PipelineDepth:            c.Config.EffectivePipelineDepth(),
+		PrePrepareResendInterval: c.prePrepareResendInterval(),
 	}
+}
+
+// prePrepareResendInterval is the heartbeat period, LeaderHeartbeatTimeout / LeaderHeartbeatCount: the leader of a
+// pipelined view resends its open pre-prepares at that pace. It is not a configuration field of its own.
+func (c *Consensus) prePrepareResendInterval() time.Duration {
+	if c.Config.LeaderHeartbeatCount == 0 {
+		return 0
+	}
+	return c.Config.LeaderHeartbeatTimeout / time.Duration(c.Config.LeaderHeartbeatCount)
 }
 
 func (c *Consensus) ValidateConfiguration(nodes []uint64) error {
@@ -439,6 +460,7 @@ func (c *Consensus) createComponents() {
 		NodesList:          c.nodes,
 		LeaderRotation:     c.Config.LeaderRotation,
 		DecisionsPerLeader: c.Config.DecisionsPerLeader,
+		PipelineDepth:      c.Config.EffectivePipelineDepth(),
 		Verifier:           c.Verifier,
 		Logger:             c.Logger,
 		Assembler:          c.Assembler,

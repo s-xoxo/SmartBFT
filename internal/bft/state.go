@@ -63,12 +63,43 @@ func (ps *PersistedState) storeProposal(proposed *protos.ProposedRecord) {
 		Payload:              proposal.GetPayload(),
 		Metadata:             proposal.GetMetadata(),
 	}
-	ps.InFlightProposal.StoreProposal(proposalToStore)
+	// Keyed by the pre-prepare's sequence, the one the commit that may follow it carries.
+	ps.InFlightProposal.StoreProposalAt(proposed.GetPrePrepare().GetSeq(), proposalToStore)
 }
 
 func (ps *PersistedState) storePrepared(commitMsg *protos.Message) {
 	cmt := commitMsg.GetCommit()
 	ps.InFlightProposal.StorePrepares(cmt.GetView(), cmt.GetSeq())
+}
+
+// InFlightSequenceInWAL reports whether the WAL ends with a proposal that is still in flight, i.e. a
+// pre-prepare (with or without the commit that follows it) of a sequence above the last decided one, and
+// which sequence that is. Restore turns such a record into a proposal in flight; with a pipeline depth
+// above one that restore is not supported yet (it would forget the other proposals in flight), so the
+// node refuses to start instead.
+func InFlightSequenceInWAL(entries [][]byte, lastDecidedSequence uint64) (seq uint64, inFlight bool) {
+	if len(entries) == 0 {
+		return 0, false
+	}
+	last := &protos.SavedMessage{}
+	if err := proto.Unmarshal(entries[len(entries)-1], last); err != nil {
+		return 0, false
+	}
+	var prePrepare *protos.PrePrepare
+	switch {
+	case last.GetProposedRecord() != nil:
+		prePrepare = last.GetProposedRecord().GetPrePrepare()
+	case last.GetCommit() != nil && len(entries) >= 2:
+		previous := &protos.SavedMessage{}
+		if err := proto.Unmarshal(entries[len(entries)-2], previous); err != nil {
+			return 0, false
+		}
+		prePrepare = previous.GetProposedRecord().GetPrePrepare()
+	}
+	if prePrepare == nil || prePrepare.GetSeq() <= lastDecidedSequence {
+		return 0, false
+	}
+	return prePrepare.GetSeq(), true
 }
 
 func (ps *PersistedState) LoadNewViewIfApplicable() (*types.ViewAndSeq, error) {

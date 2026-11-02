@@ -44,6 +44,10 @@ type RequestPool interface {
 	Submit(request []byte) error
 	Size() int
 	NextRequests(maxCount int, maxSizeBytes uint64, check bool) (batch [][]byte, full bool)
+	// Reserve marks requests that are part of a proposal in flight, so that NextRequests skips them.
+	Reserve(requests []types.RequestInfo)
+	// UnreserveAll releases every reservation; a view that starts calls it.
+	UnreserveAll()
 	RemoveRequest(request types.RequestInfo) error
 	StopTimers()
 	RestartTimers()
@@ -86,8 +90,11 @@ type Controller struct {
 	NodesList          []uint64
 	LeaderRotation     bool
 	DecisionsPerLeader uint64
-	RequestPool        RequestPool
-	Batcher            Batcher
+	// PipelineDepth is the number of proposals this node may have in flight when it leads, W (0 = 1): the
+	// capacity of the leader token channel. The view enforces the same bound on what it accepts.
+	PipelineDepth uint64
+	RequestPool   RequestPool
+	Batcher       Batcher
 	// BatchTuner adjusts the Batcher's parameters from what the leader observes (AdaptiveBatch).
 	// nil (the default) leaves the batch parameters unchanged.
 	BatchTuner       *BatchTuner
@@ -125,9 +132,12 @@ type Controller struct {
 	stopOnce sync.Once
 	stopChan chan struct{}
 
-	syncChan             chan struct{}
-	decisionChan         chan decision
-	leaderToken          chan struct{}
+	syncChan     chan struct{}
+	decisionChan chan decision
+	// leaderToken holds one token per proposal the leader may still put in flight (capacity PipelineDepth).
+	// A token carries the view it was issued for, so that a proposal is never made to a later view with a
+	// token of an earlier one: the view is the generation the token belongs to (R7).
+	leaderToken          chan Proposer
 	verificationSequence atomic.Uint64
 
 	controllerDone sync.WaitGroup
@@ -375,6 +385,10 @@ func (c *Controller) startView(proposalSequence uint64) {
 	c.currView.Start()
 	c.currViewLock.Unlock()
 
+	// Reservations belong to the view that proposed the requests; the requests of proposals the previous
+	// view did not deliver are proposed again by this one.
+	c.RequestPool.UnreserveAll()
+
 	role := Follower
 	leader, _ := c.iAmTheLeader()
 	if leader {
@@ -383,9 +397,16 @@ func (c *Controller) startView(proposalSequence uint64) {
 			// another leader or to a view that was being changed.
 			c.BatchTuner.Reset()
 		}
-		if initPhase == COMMITTED || initPhase == ABORT {
+		// R1: one token per proposal the view may have in flight, less the proposal it restored (a restored
+		// view holds at most one, in phase PROPOSED or PREPARED). With a depth of one this is one token
+		// when nothing was restored, none otherwise, as before.
+		var restored uint64
+		if initPhase == PROPOSED || initPhase == PREPARED {
+			restored = 1
+		}
+		if tokens := c.depth() - restored; tokens > 0 {
 			c.Logger.Debugf("Acquiring leader token when starting view with phase %s", initPhase.String())
-			c.acquireLeaderToken()
+			c.acquireLeaderTokens(view, tokens)
 		} else {
 			c.Logger.Debugf("Not acquiring leader token when starting view with phase %s", initPhase.String())
 		}
@@ -417,12 +438,13 @@ func (c *Controller) changeView(newViewNumber uint64, newProposalSequence uint64
 
 	c.setCurrentViewNumber(newViewNumber)
 	c.setCurrentDecisionsInView(newDecisionsInView)
-	c.Logger.Debugf("Starting view after setting decisions in view to %d", newDecisionsInView)
-	c.startView(newProposalSequence)
-
 	if iAm, _ := c.iAmTheLeader(); iAm {
+		// Reopen the batcher before the view issues its leader tokens: the proposer takes a token as soon as
+		// it is issued, and discards it when the batcher is still closed from the view change.
 		c.Batcher.Reset()
 	}
+	c.Logger.Debugf("Starting view after setting decisions in view to %d", newDecisionsInView)
+	c.startView(newProposalSequence)
 }
 
 func (c *Controller) abortView(view uint64) bool {
@@ -434,9 +456,9 @@ func (c *Controller) abortView(view uint64) bool {
 		return false
 	}
 
-	// Drain the leader token in case we held it,
-	// so we won't start proposing after view change.
-	c.relinquishLeaderToken()
+	// Drain the leader tokens in case we held them,
+	// so we won't start proposing after view change (R3).
+	c.drainLeaderTokens()
 
 	// Kill current view
 	c.Logger.Debugf("Aborting current view with number %d", c.currViewNumber)
@@ -472,8 +494,23 @@ func (c *Controller) ViewChanged(newViewNumber uint64, newProposalSequence uint6
 	c.viewChange <- viewInfo{proposalSeq: newProposalSequence, viewNumber: newViewNumber}
 }
 
-func (c *Controller) propose() {
-	if c.stopped() || c.Batcher.Closed() {
+// proposerLoop proposes a batch for every leader token, to the view the token was issued for.
+func (c *Controller) proposerLoop() {
+	for {
+		var view Proposer
+		select {
+		case <-c.stopChan:
+			return
+		case view = <-c.leaderToken:
+		}
+		c.propose(view)
+	}
+}
+
+// propose proposes the next batch to the given view with the token that was just taken for it. A token
+// of a view that stopped is discarded: the view that starts next issues its own (R7).
+func (c *Controller) propose(view Proposer) {
+	if c.stopped() || c.Batcher.Closed() || view.Stopped() {
 		return
 	}
 	nextBatch := c.Batcher.NextBatch()
@@ -481,16 +518,26 @@ func (c *Controller) propose() {
 		if c.BatchTuner != nil {
 			c.BatchTuner.OnIdle()
 		}
-		c.acquireLeaderToken() // try again later
+		c.acquireLeaderTokens(view, 1) // try again later (R5)
 		return
 	}
 	if c.BatchTuner != nil {
 		// The parameters NextBatch just used: only this goroutine changes them, right before the token is reacquired.
 		c.BatchTuner.OnBatch(nextBatch, c.Batcher.BatchParams())
 	}
-	metadata := c.currView.GetMetadata()
+	if view.Stopped() {
+		// The view stopped while the batch was built; its requests stay in the pool for the next view.
+		return
+	}
+	// The requests of a proposal in flight are not batched again until it is delivered or the view ends.
+	requests := make([]types.RequestInfo, 0, len(nextBatch))
+	for _, request := range nextBatch {
+		requests = append(requests, c.RequestInspector.RequestID(request))
+	}
+	c.RequestPool.Reserve(requests)
+	metadata := view.GetMetadata()
 	proposal := c.Assembler.AssembleProposal(metadata, nextBatch)
-	c.currView.Propose(proposal)
+	view.Propose(proposal)
 }
 
 func (c *Controller) run() {
@@ -512,8 +559,6 @@ func (c *Controller) run() {
 			c.abortView(view)
 		case <-c.stopChan:
 			return
-		case <-c.leaderToken:
-			c.propose()
 		case <-c.syncChan:
 			c.Logger.Debugf("get msg from syncChan")
 			view, seq, dec := c.sync()
@@ -540,6 +585,8 @@ func (c *Controller) decide(d decision) {
 	}
 	c.Logger.Debugf("Node %d delivered proposal", c.ID)
 	c.removeDeliveredFromPool(d)
+	// The delivered proposal is no longer in flight; with a single entry in flight this keeps it (see pruneDelivered).
+	c.InFlight.pruneDelivered(proposalSequenceOf(d.proposal))
 	close(d.delivered)
 	if c.stopped() {
 		return
@@ -575,19 +622,27 @@ func (c *Controller) decide(d decision) {
 		c.Logger.Panicf("Failed to unmarshal proposal metadata, error: %v", err)
 	}
 
+	rotated := false
 	if c.checkIfRotate(md.GetBlackList()) {
 		c.Logger.Debugf("Restarting view to rotate the leader")
 		c.changeView(c.getCurrentViewNumber(), md.GetLatestSequence()+1, c.getCurrentDecisionsInView())
 		c.Logger.Debugf("Restarting timers in request pool due to leader rotation")
 		c.RequestPool.RestartTimers()
+		rotated = true
 	}
 	c.MaybePruneRevokedRequests()
+	if rotated {
+		// The view that was just started issued the leader tokens of the new leader (R1), so a decision of the
+		// previous view does not return one (R4): with a single token the channel was full and the attempt failed
+		// anyway, with several tokens it would exceed the pipeline depth.
+		return
+	}
 	if iAm, _ := c.iAmTheLeader(); iAm {
 		if c.BatchTuner != nil {
 			// The delivered requests are out of the pool; adjust the parameters the next NextBatch call reads.
 			c.BatchTuner.OnDecision()
 		}
-		c.acquireLeaderToken()
+		c.acquireLeaderTokens(currView, 1) // R2: the delivered proposal frees one slot of the pipeline
 	}
 }
 
@@ -716,6 +771,7 @@ func (c *Controller) sync() (viewNum uint64, seq uint64, decisions uint64) {
 }
 
 func (c *Controller) maybePruneInFlight(syncResultViewMD *protos.ViewMetadata) {
+	// The lowest in-flight proposal; the ones above it are pruned with it when they are stale too.
 	inFlight := c.InFlight.InFlightProposal()
 	if inFlight == nil {
 		c.Logger.Debugf("No in-flight proposal to prune")
@@ -735,9 +791,19 @@ func (c *Controller) maybePruneInFlight(syncResultViewMD *protos.ViewMetadata) {
 	}
 	// Else we have replicated the in-flight proposal from another node or have committed it in the past,
 	// so we whenever we participate in a view change there will be no need to present this in-flight
-	// as we have corresponding signatures on the proposal.
+	// as we have corresponding signatures on the proposal. In-flight proposals above the synced
+	// sequence, if any, may still be relevant and stay.
 	c.Logger.Infof("Synced to sequence %d, deleting in-flight as it is stale", syncResultViewMD.GetLatestSequence())
-	c.InFlight.clear()
+	c.InFlight.clearUpTo(syncResultViewMD.GetLatestSequence())
+}
+
+// proposalSequenceOf returns the sequence in the metadata of a proposal that is about to be, or was, delivered.
+func proposalSequenceOf(proposal types.Proposal) uint64 {
+	md := &protos.ViewMetadata{}
+	if err := proto.Unmarshal(proposal.Metadata, md); err != nil {
+		return 0
+	}
+	return md.GetLatestSequence()
 }
 
 func (c *Controller) fetchState() *types.ViewAndSeq {
@@ -781,18 +847,35 @@ func (c *Controller) MaybePruneRevokedRequests() {
 	})
 }
 
-func (c *Controller) acquireLeaderToken() {
-	select {
-	case c.leaderToken <- struct{}{}:
-	default:
-		// No room, seems we're already a leader.
+// depth returns the pipeline depth in effect, PipelineDepth with 0 treated as 1.
+func (c *Controller) depth() uint64 {
+	if c.PipelineDepth == 0 {
+		return 1
+	}
+	return c.PipelineDepth
+}
+
+// acquireLeaderTokens issues up to n leader tokens for the given view. The channel's capacity is the
+// pipeline depth, so a token that does not fit is dropped: the leader already holds as many as it may.
+func (c *Controller) acquireLeaderTokens(view Proposer, n uint64) {
+	for range n {
+		select {
+		case c.leaderToken <- view:
+		default:
+			// No room, seems we're already a leader.
+			return
+		}
 	}
 }
 
-func (c *Controller) relinquishLeaderToken() {
-	select {
-	case <-c.leaderToken:
-	default:
+// drainLeaderTokens takes back every leader token that was not consumed.
+func (c *Controller) drainLeaderTokens() {
+	for {
+		select {
+		case <-c.leaderToken:
+		default:
+			return
+		}
 	}
 }
 
@@ -818,11 +901,11 @@ func (c *Controller) syncOnStart(startViewNumber uint64, startProposalSequence u
 // so that a later change of the Verifier's sequence prunes the pool again.
 func (c *Controller) Start(startViewNumber uint64, startProposalSequence uint64, startDecisionsInView uint64, verificationSequence uint64, syncOnStart bool) {
 	c.Logger.Debugf("Starting controller with view %d, sequence %d, and decisions %d", startViewNumber, startProposalSequence, startDecisionsInView)
-	c.controllerDone.Add(1)
+	c.controllerDone.Add(2) // run and proposerLoop
 	c.stopOnce = sync.Once{}
 	c.syncChan = make(chan struct{}, 1)
 	c.stopChan = make(chan struct{})
-	c.leaderToken = make(chan struct{}, 1)
+	c.leaderToken = make(chan Proposer, c.depth())
 	c.decisionChan = make(chan decision, 1)
 	c.viewChange = make(chan viewInfo, 1)
 	c.abortViewChan = make(chan uint64, 1)
@@ -845,6 +928,11 @@ func (c *Controller) Start(startViewNumber uint64, startProposalSequence uint64,
 	go func() {
 		defer c.controllerDone.Done()
 		c.run()
+	}()
+
+	go func() {
+		defer c.controllerDone.Done()
+		c.proposerLoop()
 	}()
 
 	c.StartedWG.Done()
@@ -870,14 +958,10 @@ func (c *Controller) Stop() {
 	c.RequestPool.Close()
 	c.LeaderMonitor.Close()
 
-	// Drain the leader token if we hold it.
-	select {
-	case <-c.leaderToken:
-	default:
-		// Do nothing
-	}
-
 	c.controllerDone.Wait()
+
+	// Drain the leader tokens if we hold any (R6); the proposer loop is gone, so none is taken anymore.
+	c.drainLeaderTokens()
 }
 
 // StopWithPoolPause the controller but only stop the requests pool timers
@@ -887,14 +971,10 @@ func (c *Controller) StopWithPoolPause() {
 	c.RequestPool.StopTimers()
 	c.LeaderMonitor.Close()
 
-	// Drain the leader token if we hold it.
-	select {
-	case <-c.leaderToken:
-	default:
-		// Do nothing
-	}
-
 	c.controllerDone.Wait()
+
+	// Drain the leader tokens if we hold any (R6); the proposer loop is gone, so none is taken anymore.
+	c.drainLeaderTokens()
 }
 
 func (c *Controller) stopped() bool {

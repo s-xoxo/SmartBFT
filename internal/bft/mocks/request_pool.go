@@ -243,6 +243,46 @@ func (_c *RequestPool_RemoveRequest_Call) RunAndReturn(run func(request types.Re
 	return _c
 }
 
+// Reserve provides a mock function for the type RequestPool
+func (_mock *RequestPool) Reserve(requests []types.RequestInfo) {
+	_mock.Called(requests)
+	return
+}
+
+// RequestPool_Reserve_Call is a *mock.Call that shadows Run/Return methods with type explicit version for method 'Reserve'
+type RequestPool_Reserve_Call struct {
+	*mock.Call
+}
+
+// Reserve is a helper method to define mock.On call
+//   - requests []types.RequestInfo
+func (_e *RequestPool_Expecter) Reserve(requests any) *RequestPool_Reserve_Call {
+	return &RequestPool_Reserve_Call{Call: _e.mock.On("Reserve", requests)}
+}
+
+func (_c *RequestPool_Reserve_Call) Run(run func(requests []types.RequestInfo)) *RequestPool_Reserve_Call {
+	_c.Call.Run(func(args mock.Arguments) {
+		var arg0 []types.RequestInfo
+		if args[0] != nil {
+			arg0 = args[0].([]types.RequestInfo)
+		}
+		run(
+			arg0,
+		)
+	})
+	return _c
+}
+
+func (_c *RequestPool_Reserve_Call) Return() *RequestPool_Reserve_Call {
+	_c.Call.Return()
+	return _c
+}
+
+func (_c *RequestPool_Reserve_Call) RunAndReturn(run func(requests []types.RequestInfo)) *RequestPool_Reserve_Call {
+	_c.Run(run)
+	return _c
+}
+
 // RestartTimers provides a mock function for the type RequestPool
 func (_mock *RequestPool) RestartTimers() {
 	_mock.Called()
@@ -401,5 +441,38 @@ func (_c *RequestPool_Submit_Call) Return(err error) *RequestPool_Submit_Call {
 
 func (_c *RequestPool_Submit_Call) RunAndReturn(run func(request []byte) error) *RequestPool_Submit_Call {
 	_c.Call.Return(run)
+	return _c
+}
+
+// UnreserveAll provides a mock function for the type RequestPool
+func (_mock *RequestPool) UnreserveAll() {
+	_mock.Called()
+	return
+}
+
+// RequestPool_UnreserveAll_Call is a *mock.Call that shadows Run/Return methods with type explicit version for method 'UnreserveAll'
+type RequestPool_UnreserveAll_Call struct {
+	*mock.Call
+}
+
+// UnreserveAll is a helper method to define mock.On call
+func (_e *RequestPool_Expecter) UnreserveAll() *RequestPool_UnreserveAll_Call {
+	return &RequestPool_UnreserveAll_Call{Call: _e.mock.On("UnreserveAll")}
+}
+
+func (_c *RequestPool_UnreserveAll_Call) Run(run func()) *RequestPool_UnreserveAll_Call {
+	_c.Call.Run(func(args mock.Arguments) {
+		run()
+	})
+	return _c
+}
+
+func (_c *RequestPool_UnreserveAll_Call) Return() *RequestPool_UnreserveAll_Call {
+	_c.Call.Return()
+	return _c
+}
+
+func (_c *RequestPool_UnreserveAll_Call) RunAndReturn(run func()) *RequestPool_UnreserveAll_Call {
+	_c.Run(run)
 	return _c
 }

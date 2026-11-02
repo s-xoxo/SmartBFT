@@ -761,3 +761,83 @@ func TestReqPoolSizeMirrorUnderConcurrency(t *testing.T) {
 	}
 	require.Equal(t, bytes, pool.SizeBytes())
 }
+
+// TestReqPoolReserve covers the reservation of requests that are part of a proposal in flight:
+// NextRequests skips reserved requests (and counts only the unreserved ones when checking whether a batch is
+// full), a removed request releases its reservation, UnreserveAll releases all of them, and Size counts the
+// reserved requests all along since they still occupy the pool.
+func TestReqPoolReserve(t *testing.T) {
+	basicLog, err := zap.NewDevelopment()
+	require.NoError(t, err)
+	log := basicLog.Sugar()
+
+	insp := &testRequestInspector{}
+	timeoutHandler := &mocks.RequestTimeoutHandler{}
+	submittedChan := make(chan struct{}, 1)
+	pool := bft.NewPool(log, insp, timeoutHandler, bft.PoolOptions{QueueSize: 20, ForwardTimeout: time.Hour}, submittedChan)
+	defer pool.Close()
+
+	const total = 12
+	infos := make([]types.RequestInfo, 0, total)
+	for i := 1; i <= total; i++ {
+		id := strconv.Itoa(i)
+		require.NoError(t, pool.Submit(makeTestRequest(id, id, "foo")))
+		infos = append(infos, types.RequestInfo{ID: id, ClientID: id})
+	}
+	require.Equal(t, total, pool.Size())
+
+	ids := func(batch [][]byte) []string {
+		res := make([]string, 0, len(batch))
+		for _, req := range batch {
+			res = append(res, insp.RequestID(req).ID)
+		}
+		return res
+	}
+
+	// Without reservations the first 10 requests make a full batch.
+	next, full := pool.NextRequests(10, 10000000, true)
+	require.Len(t, next, 10)
+	require.True(t, full)
+
+	// Reserve the first 10 (the proposal in flight); reserving unknown or already reserved requests is a no-op.
+	pool.Reserve(infos[:10])
+	pool.Reserve(infos[:10])
+	pool.Reserve([]types.RequestInfo{{ID: "unknown", ClientID: "unknown"}})
+	require.Equal(t, total, pool.Size(), "reserved requests still occupy the pool")
+
+	// With check on, only 2 unreserved requests remain, which is less than the batch size.
+	next, full = pool.NextRequests(10, 10000000, true)
+	require.Nil(t, next)
+	require.False(t, full)
+
+	// Without the check the batch holds only the unreserved requests, in FIFO order.
+	next, full = pool.NextRequests(10, 10000000, false)
+	require.Equal(t, []string{"11", "12"}, ids(next))
+	require.False(t, full)
+
+	// Two unreserved requests make a full batch of two.
+	next, full = pool.NextRequests(2, 10000000, true)
+	require.Equal(t, []string{"11", "12"}, ids(next))
+	require.True(t, full)
+
+	// Removing a reserved request (its proposal was delivered) releases its reservation.
+	require.NoError(t, pool.RemoveRequest(infos[0]))
+	require.Equal(t, total-1, pool.Size())
+	next, _ = pool.NextRequests(10, 10000000, false)
+	require.Equal(t, []string{"11", "12"}, ids(next))
+
+	// Releasing every reservation makes the remaining requests available again, in FIFO order.
+	pool.UnreserveAll()
+	next, full = pool.NextRequests(10, 10000000, true)
+	require.Equal(t, []string{"2", "3", "4", "5", "6", "7", "8", "9", "10", "11"}, ids(next))
+	require.True(t, full)
+	require.Equal(t, total-1, pool.Size())
+
+	// A second UnreserveAll with nothing reserved is a no-op, and reserving again works.
+	pool.UnreserveAll()
+	pool.Reserve(infos[1:3])
+	next, _ = pool.NextRequests(10, 10000000, false)
+	require.Equal(t, []string{"4", "5", "6", "7", "8", "9", "10", "11", "12"}, ids(next))
+
+	timeoutHandler.AssertNumberOfCalls(t, "OnRequestTimeout", 0)
+}

@@ -87,33 +87,51 @@ type View struct {
 	Verifier           api.Verifier
 	Signer             api.Signer
 	MembershipNotifier api.MembershipNotifier
-	ProposalSequence   uint64
-	DecisionsInView    uint64
-	State              State
-	Phase              Phase
-	InMsgQSize         int
+	// ProposalSequence is the lowest sequence this view has not delivered yet (the low watermark).
+	// It advances by one at every delivery, together with DecisionsInView, which is the value a
+	// proposal with sequence ProposalSequence must carry; a proposal with sequence k must carry
+	// expectedDecisions(k) = DecisionsInView + (k - ProposalSequence).
+	ProposalSequence uint64
+	DecisionsInView  uint64
+	State            State
+	// Phase is the phase of the lowest undelivered sequence. Before Start it is the hand-off of a restore
+	// from the WAL (PROPOSED/PREPARED, with the four in-flight fields below) that Start turns into a slot.
+	Phase      Phase
+	InMsgQSize int
+	// PipelineDepth is the number of proposals the leader may have in flight, W. 0 is treated as 1,
+	// the original sequential behaviour: one proposal in flight, the next proposed after delivery.
+	PipelineDepth uint64
+	// PrePrepareResendInterval is how often a leader with a pipeline depth above one broadcasts again the
+	// pre-prepares of the sequences it has not seen committed, so that a follower that missed one can prepare
+	// the sequences above it (the prefix rule). 0 disables it. With a depth of one nothing is ever resent:
+	// the sequential protocol sends every message once and recovers through sync.
+	PrePrepareResendInterval time.Duration
 	// Runtime
 	lastVotedProposalByID map[uint64]*protos.Commit
 	incMsgs               chan *incMsg
-	myProposalSig         *types.Signature
-	inFlightProposal      *types.Proposal
-	inFlightRequests      []types.RequestInfo
-	lastBroadcastSent     *protos.Message
-	// Current sequence sent prepare and commit
-	currPrepareSent *protos.Message
-	currCommitSent  *protos.Message
-	// Prev sequence sent prepare and commit
-	// to help lagging replicas catch up
-	prevPrepareSent *protos.Message
-	prevCommitSent  *protos.Message
-	// Current proposal
-	prePrepare chan *protos.Message
-	prepares   *voteSet
-	commits    *voteSet
-	// Next proposal
-	nextPrePrepare chan *protos.Message
-	nextPrepares   *voteSet
-	nextCommits    *voteSet
+	// Restore hand-off (state.go, viewchanger.go): the proposal in flight when the view is created
+	// in phase PROPOSED or PREPARED. Start moves them into the slot of ProposalSequence.
+	myProposalSig     *types.Signature
+	inFlightProposal  *types.Proposal
+	inFlightRequests  []types.RequestInfo
+	lastBroadcastSent *protos.Message
+	// seqLock guards ProposalSequence, DecisionsInView and head between the view goroutine, which
+	// writes them, and the leader's proposer goroutine, which reads them in GetMetadata and Propose.
+	seqLock sync.Mutex
+	// head is the next sequence the leader proposes; ProposalSequence <= head <= ProposalSequence + W.
+	// A follower keeps head == ProposalSequence.
+	head uint64
+	// slots holds one state machine per sequence in [ProposalSequence-W, ProposalSequence+W]: the
+	// delivered sequences below the low watermark keep only the prepare and commit sent for them, to
+	// answer lagging nodes; [ProposalSequence, ProposalSequence+W) are processed; ProposalSequence+W
+	// is only accepted (its votes and pre-prepare kept), as the "next" sequence was before.
+	slots map[uint64]*seqState
+	// verifiedSigs receives the commit signatures the verification goroutines verified, tagged by sequence.
+	verifiedSigs chan verifiedSig
+	// resendTick fires when the leader should broadcast its open pre-prepares again. It is nil, and never
+	// fires, unless the depth is above one and this node leads the view (tests inject a channel).
+	resendTick   <-chan time.Time
+	resendTicker *time.Ticker
 
 	// prePrepareBegin records, per proposal sequence, when this node accepted the pre-prepare,
 	// so that view_latency_batch_processing is measured for the sequence that is committed.
@@ -130,62 +148,159 @@ type View struct {
 	ViewSequences *atomic.Value
 }
 
+// slotPhase is the phase of a single sequence in the view.
+type slotPhase uint8
+
+const (
+	slotEmpty     slotPhase = iota // votes or a pre-prepare arrived, the pre-prepare is not processed yet
+	slotProposed                   // pre-prepare verified and persisted, prepare sent (PROPOSED)
+	slotPrepared                   // prepare quorum, commit signed, persisted and sent (PREPARED)
+	slotCommitted                  // commit quorum collected, waiting to be delivered in order
+	slotDelivered                  // delivered; only the prepare and commit sent are kept, for lagging nodes
+)
+
+// seqState is the state of one sequence: what the view kept once for "the current proposal",
+// and once more for "the next proposal", before the view handled a window of sequences.
+type seqState struct {
+	seq   uint64
+	phase slotPhase
+
+	prePrepare   *protos.Message // the first pre-prepare accepted for this sequence; later ones are dropped
+	proposal     *types.Proposal
+	proposalHash string
+	requests     []types.RequestInfo
+	prepares     *voteSet
+	commits      *voteSet
+	sigCollector *voteVerifier
+	signatures   []types.Signature // the verified commit signatures, up to Quorum-1
+	mySig        *types.Signature
+	voterIDs     []uint64 // who sent a prepare with the expected digest
+
+	lastBroadcastSent *protos.Message // the prepare or commit to (re)broadcast when the phase is entered
+	prepareSent       *protos.Message // the prepare sent, as an assist message for lagging nodes
+	commitSent        *protos.Message // the commit sent, as an assist message for lagging nodes
+	prepareBroadcast  bool            // the prepare was broadcast once since the slot became proposed
+	commitBroadcast   bool            // the commit was broadcast once since the slot became prepared
+}
+
+// digest returns the digest of the proposal of the slot, computed once.
+func (s *seqState) digest() string {
+	if s.proposalHash == "" {
+		s.proposalHash = s.proposal.Digest()
+	}
+	return s.proposalHash
+}
+
+// release frees what a delivered slot no longer needs, keeping only what lagging nodes may ask for.
+func (s *seqState) release() {
+	s.prePrepare = nil
+	s.proposal = nil
+	s.requests = nil
+	s.prepares = nil
+	s.commits = nil
+	s.sigCollector = nil
+	s.signatures = nil
+	s.voterIDs = nil
+	s.lastBroadcastSent = nil
+}
+
+// verifiedSig is a commit signature a verification goroutine verified, for the sequence it was cast on.
+type verifiedSig struct {
+	seq uint64
+	sig types.Signature
+}
+
+// depth returns the pipeline depth W in effect: PipelineDepth, with 0 treated as 1.
+func (v *View) depth() uint64 {
+	if v.PipelineDepth == 0 {
+		return 1
+	}
+	return v.PipelineDepth
+}
+
+// expectedDecisions returns the DecisionsInView a proposal with the given sequence must carry.
+// The leader uses it for the sequence it proposes next and a follower for the sequence it verifies,
+// and the two agree because ProposalSequence and DecisionsInView always advance together.
+// Call with seq >= ProposalSequence.
+func (v *View) expectedDecisions(seq uint64) uint64 {
+	return v.DecisionsInView + (seq - v.ProposalSequence)
+}
+
 // Start starts the view
 func (v *View) Start() {
-	v.stopOnce = sync.Once{}
-	v.incMsgs = make(chan *incMsg, v.InMsgQSize)
-	v.abortChan = make(chan struct{})
-	v.lastVotedProposalByID = make(map[uint64]*protos.Commit)
-	v.viewEnded.Add(1)
-
-	v.prePrepare = make(chan *protos.Message, 1)
-	v.nextPrePrepare = make(chan *protos.Message, 1)
-
-	v.setupVotes()
+	v.setup()
 
 	go func() {
 		v.run()
 	}()
 }
 
-func (v *View) setupVotes() {
-	// Prepares
-	acceptPrepares := func(_ uint64, message *protos.Message) bool {
-		return message.GetPrepare() != nil
-	}
+// setup initialises the runtime state of the view, before its goroutine runs.
+func (v *View) setup() {
+	v.stopOnce = sync.Once{}
+	v.incMsgs = make(chan *incMsg, v.InMsgQSize)
+	v.abortChan = make(chan struct{})
+	v.lastVotedProposalByID = make(map[uint64]*protos.Commit)
+	v.viewEnded.Add(1)
 
-	v.prepares = &voteSet{
-		validVote: acceptPrepares,
-	}
-	v.prepares.clear(v.N)
+	v.slots = make(map[uint64]*seqState)
+	// Every slot that is in flight at the same time casts at most N-1 verified commit signatures;
+	// the sends also give up when the view is aborted, so the capacity is not load-bearing.
+	v.verifiedSigs = make(chan verifiedSig, int(v.N)*(2*int(v.depth())+2))
+	v.head = v.ProposalSequence
 
-	v.nextPrepares = &voteSet{
-		validVote: acceptPrepares,
-	}
-	v.nextPrepares.clear(v.N)
-
-	// Commits
-	acceptCommits := func(sender uint64, message *protos.Message) bool {
-		commit := message.GetCommit()
-		if commit == nil {
-			return false
+	if v.Phase == PROPOSED || v.Phase == PREPARED {
+		// A proposal restored from the WAL, or the in-flight proposal of a view change,
+		// is the proposal of the lowest sequence; it has not been proposed to anyone by this view.
+		slot := v.slot(v.ProposalSequence)
+		slot.proposal = v.inFlightProposal
+		slot.requests = v.inFlightRequests
+		slot.lastBroadcastSent = v.lastBroadcastSent
+		slot.mySig = v.myProposalSig
+		slot.phase = slotProposed
+		if v.Phase == PREPARED {
+			slot.phase = slotPrepared
 		}
-		if commit.GetSignature() == nil {
-			return false
-		}
-		// Sender needs to match the inner signature sender
-		return commit.GetSignature().GetSigner() == sender
+		v.head = v.ProposalSequence + 1
 	}
 
-	v.commits = &voteSet{
-		validVote: acceptCommits,
+	if v.resendTick == nil && v.depth() > 1 && v.SelfID == v.LeaderID && v.PrePrepareResendInterval > 0 {
+		v.resendTicker = time.NewTicker(v.PrePrepareResendInterval)
+		v.resendTick = v.resendTicker.C
 	}
-	v.commits.clear(v.N)
+}
 
-	v.nextCommits = &voteSet{
-		validVote: acceptCommits,
+// slot returns the state of the given sequence, creating it when it is the first message for that sequence:
+// votes may arrive before the pre-prepare and have to be kept.
+func (v *View) slot(seq uint64) *seqState {
+	if slot, exists := v.slots[seq]; exists {
+		return slot
 	}
-	v.nextCommits.clear(v.N)
+	slot := &seqState{
+		seq: seq,
+		prepares: &voteSet{
+			validVote: func(_ uint64, message *protos.Message) bool {
+				return message.GetPrepare() != nil
+			},
+		},
+		commits: &voteSet{
+			validVote: func(sender uint64, message *protos.Message) bool {
+				commit := message.GetCommit()
+				if commit == nil {
+					return false
+				}
+				if commit.GetSignature() == nil {
+					return false
+				}
+				// Sender needs to match the inner signature sender
+				return commit.GetSignature().GetSigner() == sender
+			},
+		},
+	}
+	slot.prepares.clear(v.N)
+	slot.commits.clear(v.N)
+	v.slots[seq] = slot
+	return slot
 }
 
 // HandleMessage handles incoming messages
@@ -221,23 +336,29 @@ func (v *View) processMsg(sender uint64, m *protos.Message) {
 		return
 	}
 
-	if msgProposalSeq == v.ProposalSequence-1 && v.ProposalSequence > 0 {
+	// Route by sequence, relative to the low watermark (the lowest undelivered sequence) and the depth W:
+	//   [low-W, low)   delivered: answer with the prepare or commit sent, to help a lagging node catch up
+	//   [low, low+W]   accepted: W sequences are processed, and one more is kept, since a follower may be
+	//                  one delivery behind the leader (the "next" sequence of the sequential view)
+	//   anything else  too old or too far ahead: find out whether we need to sync
+	// With W=1 this is: the previous sequence, the current and the next one, and the rest.
+	low, depth := v.ProposalSequence, v.depth()
+	if msgProposalSeq < low && low-msgProposalSeq <= depth {
 		v.handlePrevSeqMessage(msgProposalSeq, sender, m)
 		return
 	}
 
 	v.Logger.Debugf("%d got message %s from %d with seq %d", v.SelfID, MsgToString(m), sender, msgProposalSeq)
-	// This message is either for this proposal or the next one (we might be behind the rest)
-	if msgProposalSeq != v.ProposalSequence && msgProposalSeq != v.ProposalSequence+1 {
+	if msgProposalSeq < low || msgProposalSeq > low+depth {
 		v.Logger.Infof("%d got message from %d with sequence %d but our sequence is %d", v.SelfID, sender, msgProposalSeq, v.ProposalSequence)
 		v.discoverIfSyncNeeded(sender, m)
 		return
 	}
 
-	msgForNextProposal := msgProposalSeq == v.ProposalSequence+1
+	slot := v.slot(msgProposalSeq)
 
 	if pp := m.GetPrePrepare(); pp != nil {
-		v.processPrePrepare(pp, m, msgForNextProposal, sender)
+		v.storePrePrepare(slot, pp, m, sender)
 		return
 	}
 
@@ -248,24 +369,19 @@ func (v *View) processMsg(sender uint64, m *protos.Message) {
 	}
 
 	if prp := m.GetPrepare(); prp != nil {
-		if msgForNextProposal {
-			v.nextPrepares.registerVote(sender, m)
-		} else {
-			v.prepares.registerVote(sender, m)
-		}
+		slot.prepares.registerVote(sender, m)
 		return
 	}
 
 	if cmt := m.GetCommit(); cmt != nil {
-		if msgForNextProposal {
-			v.nextCommits.registerVote(sender, m)
-		} else {
-			v.commits.registerVote(sender, m)
-		}
+		slot.commits.registerVote(sender, m)
 		return
 	}
 }
 
+// run drives the view: every event (a message, a verified commit signature) is followed by a pass over
+// the open sequences, each advanced as far as what arrived allows. The passes do not block, so the
+// loop only wakes up on events.
 func (v *View) run() {
 	defer v.viewEnded.Done()
 	defer func() {
@@ -274,38 +390,102 @@ func (v *View) run() {
 			ViewActive:  false,
 		})
 	}()
+	if v.resendTicker != nil {
+		defer v.resendTicker.Stop()
+	}
+	v.doPhase() // a restored proposal broadcasts its prepare or commit again right away
 	for {
 		select {
 		case <-v.abortChan:
 			return
 		case msg := <-v.incMsgs:
 			v.processMsg(msg.sender, msg.Message)
-		default:
-			v.doPhase()
+		case vs := <-v.verifiedSigs:
+			v.acceptVerifiedSig(vs)
+		case <-v.resendTick: // nil, so never, unless the depth is above one and this node leads
+			v.resendPrePrepares()
 		}
+		if v.Stopped() {
+			return
+		}
+		v.doPhase()
 	}
 }
 
+// doPhase advances the sequences in [low, low+W) in order, as far as the messages that arrived allow,
+// and delivers the committed ones in order. A sequence is processed (verified, persisted, prepared) only
+// once every lower sequence of the window has been: the prepare of sequence k acknowledges the
+// pre-prepares of all sequences up to k, so the processed sequences always form a prefix of the window.
 func (v *View) doPhase() {
-	switch v.Phase {
-	case PROPOSED:
-		v.Comm.BroadcastConsensus(v.lastBroadcastSent) // broadcast here serves also recovery
-		v.Phase = v.processPrepares()
-	case PREPARED:
-		v.Comm.BroadcastConsensus(v.lastBroadcastSent)
-		v.Phase = v.prepared()
-	case COMMITTED:
-		v.Phase = v.processProposal()
-	case ABORT:
-		return
-	default:
-		v.Logger.Panicf("Unknown phase in view : %v", v)
+	for !v.Stopped() {
+		low := v.ProposalSequence
+		v.stepWindow()
+		v.tryDeliver()
+		if v.ProposalSequence == low {
+			break
+		}
+		// Something was delivered, so the window moved: the sequences that entered it may be processed now.
 	}
 
+	v.Phase = v.phaseOfLowest()
 	v.MetricsView.Phase.Set(float64(v.Phase))
 }
 
-func (v *View) processPrePrepare(pp *protos.PrePrepare, m *protos.Message, msgForNextProposal bool, sender uint64) {
+// stepWindow steps every sequence in [low, low+W) once, in order, stopping at the first gap.
+func (v *View) stepWindow() {
+	low, depth := v.ProposalSequence, v.depth()
+	for seq := low; seq < low+depth; seq++ {
+		slot := v.slots[seq]
+		if slot == nil {
+			return // nothing arrived for this sequence, so nothing above it may be processed
+		}
+		if slot.phase == slotEmpty {
+			if slot.prePrepare == nil {
+				return // a gap: its votes and those of the sequences above are kept until it is filled
+			}
+			if !v.processProposal(slot) {
+				return // the proposal was rejected and the view is stopping
+			}
+		}
+		if slot.phase == slotProposed {
+			if !slot.prepareBroadcast {
+				v.Comm.BroadcastConsensus(slot.lastBroadcastSent) // broadcast here serves also recovery
+				slot.prepareBroadcast = true
+			}
+			v.stepPrepares(slot)
+		}
+		if slot.phase == slotPrepared {
+			if !slot.commitBroadcast {
+				v.Comm.BroadcastConsensus(slot.lastBroadcastSent)
+				slot.commitBroadcast = true
+			}
+			v.stepCommits(slot)
+		}
+		// a committed slot waits for tryDeliver, which delivers in order
+	}
+}
+
+// phaseOfLowest maps the slot of the lowest undelivered sequence to the phase of the view.
+func (v *View) phaseOfLowest() Phase {
+	if v.Stopped() {
+		return ABORT
+	}
+	slot := v.slots[v.ProposalSequence]
+	if slot == nil {
+		return COMMITTED
+	}
+	switch slot.phase {
+	case slotProposed:
+		return PROPOSED
+	case slotPrepared, slotCommitted:
+		return PREPARED
+	default:
+		return COMMITTED
+	}
+}
+
+// storePrePrepare keeps the first pre-prepare of a sequence, to be processed in order by doPhase.
+func (v *View) storePrePrepare(slot *seqState, pp *protos.PrePrepare, m *protos.Message, sender uint64) {
 	if pp.GetProposal() == nil {
 		v.Logger.Warnf("%d got pre-prepare from %d with empty proposal", v.SelfID, sender)
 		return
@@ -315,34 +495,65 @@ func (v *View) processPrePrepare(pp *protos.PrePrepare, m *protos.Message, msgFo
 		return
 	}
 
-	prePrepareChan := v.prePrepare
-	currentOrNext := "current"
-
-	if msgForNextProposal {
-		prePrepareChan = v.nextPrePrepare
-		currentOrNext = "next"
+	if slot.prePrepare != nil || slot.phase != slotEmpty {
+		// A sequence accepts one pre-prepare only; a conflicting one is dropped, the first one wins.
+		if v.depth() > 1 && proto.Equal(slot.prePrepare, m) {
+			// The leader of a pipelined view broadcasts its open pre-prepares again periodically, so
+			// the same message is expected to arrive again; it is not worth a warning.
+			v.Logger.Debugf("Got the pre-prepare for sequence %d again, ignoring it", slot.seq)
+			return
+		}
+		currentOrNext := "current"
+		if slot.seq != v.ProposalSequence {
+			currentOrNext = "next"
+		}
+		v.Logger.Warnf("Got a pre-prepare for %s sequence without processing previous one, dropping message", currentOrNext)
+		return
 	}
 
-	select {
-	case prePrepareChan <- m:
-	default:
-		v.Logger.Warnf("Got a pre-prepare for %s sequence without processing previous one, dropping message", currentOrNext)
+	slot.prePrepare = m
+}
+
+// acceptVerifiedSig collects a verified commit signature into its slot, up to the Quorum-1 the slot needs.
+func (v *View) acceptVerifiedSig(vs verifiedSig) {
+	slot := v.slots[vs.seq]
+	if slot == nil || slot.phase != slotPrepared || len(slot.signatures) >= v.Quorum-1 {
+		return
+	}
+	slot.signatures = append(slot.signatures, vs.sig)
+}
+
+// resendPrePrepares broadcasts again the pre-prepares of the sequences this leader proposed and has not
+// seen committed, so that a follower that missed one fills the gap and prepares what is above it. A sequence
+// that is committed here was accepted by a quorum; a node that lacks it catches up through the previous
+// sequence messages or through sync, as it always did.
+func (v *View) resendPrePrepares() {
+	for seq := v.ProposalSequence; seq < v.head; seq++ {
+		slot := v.slots[seq]
+		if slot == nil || slot.prePrepare == nil || slot.phase >= slotCommitted {
+			continue
+		}
+		v.Comm.BroadcastConsensus(slot.prePrepare)
 	}
 }
 
-func (v *View) prepared() Phase {
-	proposal := v.inFlightProposal
-	signatures, phase := v.processCommits(proposal)
-	if phase == ABORT {
-		return ABORT
-	}
+// inFlightCount returns how many sequences the leader proposed and has not delivered yet.
+func (v *View) inFlightCount() uint64 {
+	v.seqLock.Lock()
+	defer v.seqLock.Unlock()
+	return v.head - v.ProposalSequence
+}
 
-	seq := v.ProposalSequence
+// onCommitQuorum marks a sequence as committed; tryDeliver delivers it once every lower sequence was delivered.
+func (v *View) onCommitQuorum(slot *seqState) {
+	proposal := slot.proposal
+	signatures := slot.signatures
+	seq := slot.seq
 
 	v.Logger.Infof("%d processed commits for proposal with seq %d", v.SelfID, seq)
 
 	v.MetricsView.CountBatchAll.Add(1)
-	v.MetricsView.CountTxsAll.Add(float64(len(v.inFlightRequests)))
+	v.MetricsView.CountTxsAll.Add(float64(len(slot.requests)))
 	size := 0
 	size += len(proposal.Metadata) + len(proposal.Header) + len(proposal.Payload)
 	for i := range signatures {
@@ -351,9 +562,7 @@ func (v *View) prepared() Phase {
 	v.MetricsView.SizeOfBatch.Add(float64(size))
 	v.observeBatchProcessingLatency(seq)
 
-	v.decide(proposal, signatures, v.inFlightRequests)
-	v.MetricsView.InFlightProposals.Set(float64(len(v.prePrepareBegin)))
-	return COMMITTED
+	slot.phase = slotCommitted
 }
 
 // recordPrePrepareBegin marks the time this node accepted the pre-prepare of the given sequence,
@@ -377,53 +586,32 @@ func (v *View) observeBatchProcessingLatency(seq uint64) {
 	v.MetricsView.LatencyBatchProcessing.Observe(time.Since(begin).Seconds())
 }
 
-func (v *View) processProposal() Phase {
-	v.prevPrepareSent = v.currPrepareSent
-	v.prevCommitSent = v.currCommitSent
-	v.currPrepareSent = nil
-	v.currCommitSent = nil
-	v.inFlightProposal = nil
-	v.inFlightRequests = nil
-	v.lastBroadcastSent = nil
-
-	var proposal types.Proposal
-	var receivedProposal *protos.Message
-	var prevCommits []*protos.Signature
-
-	var gotPrePrepare bool
-	for !gotPrePrepare {
-		select {
-		case <-v.abortChan:
-			return ABORT
-		case msg := <-v.incMsgs:
-			v.processMsg(msg.sender, msg.Message)
-		case msg := <-v.prePrepare:
-			gotPrePrepare = true
-			receivedProposal = msg
-			prePrepare := msg.GetPrePrepare()
-			prop := prePrepare.GetProposal()
-			prevCommits = prePrepare.GetPrevCommitSignatures()
-			proposal = types.Proposal{
-				VerificationSequence: int64(prop.GetVerificationSequence()),
-				Metadata:             prop.GetMetadata(),
-				Payload:              prop.GetPayload(),
-				Header:               prop.GetHeader(),
-			}
-		}
+// processProposal verifies the pre-prepare of the slot, persists it and prepares the prepare to broadcast.
+// It returns false when the proposal is rejected, in which case the view is stopping.
+func (v *View) processProposal(slot *seqState) bool {
+	receivedProposal := slot.prePrepare
+	prePrepare := receivedProposal.GetPrePrepare()
+	prop := prePrepare.GetProposal()
+	prevCommits := prePrepare.GetPrevCommitSignatures()
+	proposal := types.Proposal{
+		VerificationSequence: int64(prop.GetVerificationSequence()),
+		Metadata:             prop.GetMetadata(),
+		Payload:              prop.GetPayload(),
+		Header:               prop.GetHeader(),
 	}
 
-	requests, err := v.verifyProposal(proposal, prevCommits)
+	requests, err := v.verifyProposal(slot.seq, proposal, prevCommits)
 	if err != nil {
 		v.Logger.Warnf("%d received bad proposal from %d: %v", v.SelfID, v.LeaderID, err)
 		v.FailureDetector.Complain(v.Number, false)
 		v.Sync.Sync()
 		v.stop()
-		return ABORT
+		return false
 	}
 
 	v.MetricsView.CountTxsInBatch.Set(float64(len(requests)))
 
-	seq := v.ProposalSequence
+	seq := slot.seq
 	v.recordPrePrepareBegin(seq)
 
 	prepareMessage := v.createPrepare(seq, proposal)
@@ -442,18 +630,19 @@ func (v *View) processProposal() Phase {
 	if err = v.State.Save(savedMsg, true); err != nil {
 		v.Logger.Panicf("Failed to save message to state, error: %v", err)
 	}
-	v.lastBroadcastSent = prepareMessage
-	v.currPrepareSent = proto.Clone(prepareMessage).(*protos.Message)
-	v.currPrepareSent.GetPrepare().Assist = true
-	v.inFlightProposal = &proposal
-	v.inFlightRequests = requests
+	slot.lastBroadcastSent = prepareMessage
+	slot.prepareSent = proto.Clone(prepareMessage).(*protos.Message)
+	slot.prepareSent.GetPrepare().Assist = true
+	slot.proposal = &proposal
+	slot.requests = requests
 
 	if v.SelfID == v.LeaderID {
 		v.Comm.BroadcastConsensus(receivedProposal)
 	}
 
 	v.Logger.Infof("Processed proposal with seq %d", seq)
-	return PROPOSED
+	slot.phase = slotProposed
+	return true
 }
 
 func (v *View) createPrepare(seq uint64, proposal types.Proposal) *protos.Message {
@@ -468,27 +657,27 @@ func (v *View) createPrepare(seq uint64, proposal types.Proposal) *protos.Messag
 	}
 }
 
-func (v *View) processPrepares() Phase {
-	proposal := v.inFlightProposal
-	expectedDigest := proposal.Digest()
+// stepPrepares consumes the prepares that arrived for the slot and, on a quorum, signs and persists the commit
+// to broadcast. It does not wait: a slot without a quorum yet is stepped again after the next event.
+func (v *View) stepPrepares(slot *seqState) {
+	proposal := slot.proposal
+	expectedDigest := slot.digest()
 
-	var voterIDs []uint64
-	for len(voterIDs) < v.Quorum-1 {
+	for len(slot.voterIDs) < v.Quorum-1 {
 		select {
-		case <-v.abortChan:
-			return ABORT
-		case msg := <-v.incMsgs:
-			v.processMsg(msg.sender, msg.Message)
-		case vote := <-v.prepares.votes:
+		case vote := <-slot.prepares.votes:
 			prepare := vote.GetPrepare()
 			if prepare.GetDigest() != expectedDigest {
 				seq := v.ProposalSequence
 				v.Logger.Warnf("Got wrong digest at processPrepares for prepare with seq %d, expecting %v but got %v, we are in seq %d", prepare.GetSeq(), expectedDigest, prepare.GetDigest(), seq)
 				continue
 			}
-			voterIDs = append(voterIDs, vote.sender)
+			slot.voterIDs = append(slot.voterIDs, vote.sender)
+		default:
+			return // no more prepares for now
 		}
 	}
+	voterIDs := slot.voterIDs
 
 	v.Logger.Infof("%d collected %d prepares from %v", v.SelfID, len(voterIDs), voterIDs)
 
@@ -508,9 +697,9 @@ func (v *View) processPrepares() Phase {
 		v.Logger.Panicf("Failed marshaling prepares from: %v", err)
 	}
 
-	v.myProposalSig = v.Signer.SignProposal(*proposal, prpFromRaw)
+	slot.mySig = v.Signer.SignProposal(*proposal, prpFromRaw)
 
-	seq := v.ProposalSequence
+	seq := slot.seq
 
 	commitMsg := &protos.Message{
 		Content: &protos.Message_Commit{
@@ -519,9 +708,9 @@ func (v *View) processPrepares() Phase {
 				Digest: expectedDigest,
 				Seq:    seq,
 				Signature: &protos.Signature{
-					Signer: v.myProposalSig.ID,
-					Value:  v.myProposalSig.Value,
-					Msg:    v.myProposalSig.Msg,
+					Signer: slot.mySig.ID,
+					Value:  slot.mySig.Value,
+					Msg:    slot.mySig.Msg,
 				},
 			},
 		},
@@ -539,49 +728,55 @@ func (v *View) processPrepares() Phase {
 	if err = v.State.Save(preparedProof, false); err != nil {
 		v.Logger.Panicf("Failed to save message to state, error: %v", err)
 	}
-	v.currCommitSent = proto.Clone(commitMsg).(*protos.Message)
-	v.currCommitSent.GetCommit().Assist = true
-	v.lastBroadcastSent = commitMsg
+	slot.commitSent = proto.Clone(commitMsg).(*protos.Message)
+	slot.commitSent.GetCommit().Assist = true
+	slot.lastBroadcastSent = commitMsg
 
 	v.Logger.Infof("Processed prepares for proposal with seq %d", seq)
-	return PREPARED
+	slot.phase = slotPrepared
 }
 
-func (v *View) processCommits(proposal *types.Proposal) ([]types.Signature, Phase) {
-	var signatures []types.Signature
-
-	signatureCollector := &voteVerifier{
-		validVotes:     make(chan types.Signature, cap(v.commits.votes)),
-		expectedDigest: proposal.Digest(),
-		proposal:       proposal,
-		v:              v,
-	}
-
-	var voterIDs []uint64
-
-	for len(signatures) < v.Quorum-1 {
-		select {
-		case <-v.abortChan:
-			return nil, ABORT
-		case msg := <-v.incMsgs:
-			v.processMsg(msg.sender, msg.Message)
-		case vote := <-v.commits.votes:
-			// Valid votes end up written into the 'validVotes' channel.
-			go func(vote *protos.Message) {
-				signatureCollector.verifyVote(vote)
-			}(vote.Message)
-		case signature := <-signatureCollector.validVotes:
-			signatures = append(signatures, signature)
-			voterIDs = append(voterIDs, signature.ID)
+// stepCommits hands the commits that arrived for the slot to verification goroutines, whose results come
+// back through verifiedSigs, and marks the slot committed once Quorum-1 signatures were verified.
+func (v *View) stepCommits(slot *seqState) {
+	if slot.sigCollector == nil {
+		slot.sigCollector = &voteVerifier{
+			seq:            slot.seq,
+			expectedDigest: slot.digest(),
+			proposal:       slot.proposal,
+			v:              v,
 		}
 	}
 
-	v.Logger.Infof("%d collected %d commits from %v", v.SelfID, len(signatures), voterIDs)
+	collector := slot.sigCollector // the slot may be released before a goroutine runs; the collector stays
+	for {
+		select {
+		case vote := <-slot.commits.votes:
+			// Valid votes end up written into the 'verifiedSigs' channel.
+			go func(vote *protos.Message) {
+				collector.verifyVote(vote)
+			}(vote.Message)
+			continue
+		default:
+		}
+		break
+	}
 
-	return signatures, COMMITTED
+	if len(slot.signatures) < v.Quorum-1 {
+		return
+	}
+
+	voterIDs := make([]uint64, 0, len(slot.signatures))
+	for _, signature := range slot.signatures {
+		voterIDs = append(voterIDs, signature.ID)
+	}
+	v.Logger.Infof("%d collected %d commits from %v", v.SelfID, len(slot.signatures), voterIDs)
+
+	v.onCommitQuorum(slot)
 }
 
-func (v *View) verifyProposal(proposal types.Proposal, prevCommits []*protos.Signature) ([]types.RequestInfo, error) {
+// verifyProposal verifies a proposal that was pre-prepared for the given sequence.
+func (v *View) verifyProposal(seq uint64, proposal types.Proposal, prevCommits []*protos.Signature) ([]types.RequestInfo, error) {
 	// Verify proposal has correct structure and contains authorized requests.
 	requests, err := v.Verifier.VerifyProposal(proposal)
 	if err != nil {
@@ -600,13 +795,13 @@ func (v *View) verifyProposal(proposal types.Proposal, prevCommits []*protos.Sig
 		return nil, errors.New("invalid view number")
 	}
 
-	if md.GetLatestSequence() != v.ProposalSequence {
-		v.Logger.Warnf("Expected proposal sequence %d but got %d", v.ProposalSequence, md.GetLatestSequence())
+	if md.GetLatestSequence() != seq {
+		v.Logger.Warnf("Expected proposal sequence %d but got %d", seq, md.GetLatestSequence())
 		return nil, errors.New("invalid proposal sequence")
 	}
 
-	if md.GetDecisionsInView() != v.DecisionsInView {
-		v.Logger.Warnf("Expected decisions in view %d but got %d", v.DecisionsInView, md.GetDecisionsInView())
+	if expectedDecisions := v.expectedDecisions(seq); md.GetDecisionsInView() != expectedDecisions {
+		v.Logger.Warnf("Expected decisions in view %d but got %d", expectedDecisions, md.GetDecisionsInView())
 		return nil, errors.New("invalid decisions in view")
 	}
 
@@ -758,14 +953,20 @@ func (v *View) handlePrevSeqMessage(msgProposalSeq, sender uint64, m *protos.Mes
 
 	var found bool
 
+	// The slot of a delivered sequence keeps the prepare and commit sent for it, if this view sent them.
+	var prevPrepareSent, prevCommitSent *protos.Message
+	if slot := v.slots[msgProposalSeq]; slot != nil {
+		prevPrepareSent, prevCommitSent = slot.prepareSent, slot.commitSent
+	}
+
 	switch msgType {
 	case "prepare":
 		// This is an assist message, we don't need to reply to it.
 		if m.GetPrepare().GetAssist() {
 			return
 		}
-		if v.prevPrepareSent != nil {
-			v.Comm.SendConsensus(sender, v.prevPrepareSent)
+		if prevPrepareSent != nil {
+			v.Comm.SendConsensus(sender, prevPrepareSent)
 			found = true
 		}
 	case "commit":
@@ -773,8 +974,8 @@ func (v *View) handlePrevSeqMessage(msgProposalSeq, sender uint64, m *protos.Mes
 		if m.GetCommit().GetAssist() {
 			return
 		}
-		if v.prevCommitSent != nil {
-			v.Comm.SendConsensus(sender, v.prevCommitSent)
+		if prevCommitSent != nil {
+			v.Comm.SendConsensus(sender, prevCommitSent)
 			found = true
 		}
 	}
@@ -850,9 +1051,9 @@ func (v *View) discoverIfSyncNeeded(sender uint64, m *protos.Message) {
 
 type voteVerifier struct {
 	v              *View
+	seq            uint64
 	proposal       *types.Proposal
 	expectedDigest string
-	validVotes     chan types.Signature
 }
 
 func (vv *voteVerifier) verifyVote(vote *protos.Message) {
@@ -872,28 +1073,56 @@ func (vv *voteVerifier) verifyVote(vote *protos.Message) {
 		return
 	}
 
-	vv.validVotes <- types.Signature{
-		ID:    commit.GetSignature().GetSigner(),
-		Value: commit.GetSignature().GetValue(),
-		Msg:   commit.GetSignature().GetMsg(),
+	verified := verifiedSig{
+		seq: vv.seq,
+		sig: types.Signature{
+			ID:    commit.GetSignature().GetSigner(),
+			Value: commit.GetSignature().GetValue(),
+			Msg:   commit.GetSignature().GetMsg(),
+		},
+	}
+	select {
+	case vv.v.verifiedSigs <- verified:
+	case <-vv.v.abortChan: // the view ended, nobody collects signatures anymore
 	}
 }
 
-func (v *View) decide(proposal *types.Proposal, signatures []types.Signature, requests []types.RequestInfo) {
-	v.Logger.Infof("Deciding on seq %d", v.ProposalSequence)
-	// first make preparations for the next sequence so that the view will be ready to continue right after delivery
-	v.startNextSeq()
-	signatures = append(signatures, *v.myProposalSig)
-	v.Decider.Decide(*proposal, signatures, requests)
+// tryDeliver delivers the committed sequences in order: only the lowest undelivered sequence is delivered,
+// and only once its commit quorum was collected. Delivery blocks the view, as it did, so a later sequence
+// that is already committed waits in its slot for the next iteration.
+func (v *View) tryDeliver() {
+	for {
+		slot := v.slots[v.ProposalSequence]
+		if slot == nil || slot.phase != slotCommitted || v.Stopped() {
+			return
+		}
+		v.Logger.Infof("Deciding on seq %d", slot.seq)
+		// first make preparations for the next sequence so that the view will be ready to continue right after delivery
+		v.advanceLow()
+		signatures := make([]types.Signature, 0, len(slot.signatures)+1)
+		signatures = append(signatures, slot.signatures...)
+		signatures = append(signatures, *slot.mySig)
+		v.Decider.Decide(*slot.proposal, signatures, slot.requests)
+		v.MetricsView.InFlightProposals.Set(float64(len(v.prePrepareBegin)))
+		slot.phase = slotDelivered
+		slot.release()
+		v.gcSlots()
+	}
 }
 
-func (v *View) startNextSeq() {
+// advanceLow moves the low watermark past the sequence that is being delivered: the only place where
+// ProposalSequence and DecisionsInView advance, always together.
+func (v *View) advanceLow() {
+	v.seqLock.Lock()
 	prevSeq := v.ProposalSequence
 
 	v.ProposalSequence++
 	v.DecisionsInView++
+	// A follower, or a leader that restored a proposal, proposes nothing: its head follows the low watermark.
+	v.head = max(v.head, v.ProposalSequence)
 
 	nextSeq := v.ProposalSequence
+	v.seqLock.Unlock()
 
 	// Publish the sequence this view is about to propose next. Without this the stored
 	// sequence stays at the one that was just decided, and every reader of it - the
@@ -903,40 +1132,36 @@ func (v *View) startNextSeq() {
 	// exactly the sequence in flight.
 	v.ViewSequences.Store(ViewSequence{ProposalSeq: nextSeq, ViewActive: true})
 
-	v.MetricsView.ProposalSequence.Set(float64(v.ProposalSequence))
+	v.MetricsView.ProposalSequence.Set(float64(nextSeq))
 	v.MetricsView.DecisionsInView.Set(float64(v.DecisionsInView))
 
 	v.Logger.Infof("Sequence: %d-->%d", prevSeq, nextSeq)
-
-	// swap next prePrepare
-	tmp := v.prePrepare
-	v.prePrepare = v.nextPrePrepare
-	// clear tmp
-	for len(tmp) > 0 {
-		<-tmp
-	}
-	tmp = make(chan *protos.Message, 1)
-	v.nextPrePrepare = tmp
-
-	// swap next prepares
-	tmpVotes := v.prepares
-	v.prepares = v.nextPrepares
-	tmpVotes.clear(v.N)
-	v.nextPrepares = tmpVotes
-
-	// swap next commits
-	tmpVotes = v.commits
-	v.commits = v.nextCommits
-	tmpVotes.clear(v.N)
-	v.nextCommits = tmpVotes
 }
 
-// GetMetadata returns the current sequence and view number (in a marshaled ViewMetadata protobuf message)
+// gcSlots forgets the delivered sequences below the window that answers lagging nodes.
+func (v *View) gcSlots() {
+	low, depth := v.ProposalSequence, v.depth()
+	if low <= depth {
+		return
+	}
+	for seq := range v.slots {
+		if seq < low-depth {
+			delete(v.slots, seq)
+		}
+	}
+}
+
+// GetMetadata returns the sequence the leader proposes next and the view number (in a marshaled ViewMetadata protobuf message)
 func (v *View) GetMetadata() []byte {
+	v.seqLock.Lock()
+	seq := v.head
+	decisions := v.expectedDecisions(seq)
+	v.seqLock.Unlock()
+
 	metadata := &protos.ViewMetadata{
 		ViewId:          v.Number,
-		LatestSequence:  v.ProposalSequence,
-		DecisionsInView: v.DecisionsInView,
+		LatestSequence:  seq,
+		DecisionsInView: decisions,
 	}
 
 	v.Logger.Debugf("GetMetadata with view %d, seq %d, dec %d", metadata.GetViewId(), metadata.GetLatestSequence(), metadata.GetDecisionsInView())
@@ -970,7 +1195,7 @@ func (v *View) metadataWithUpdatedBlacklist(metadata *protos.ViewMetadata, verif
 
 	if verificationSeq == prevProp.GetVerificationSequence() && !membershipChange {
 		v.Logger.Debugf("Proposing proposal %d with verification sequence of %d and %d commit signatures",
-			v.ProposalSequence, verificationSeq, len(prevSigs))
+			metadata.GetLatestSequence(), verificationSeq, len(prevSigs))
 		return v.updateBlacklistMetadata(metadata, prevSigs, prevProp.GetMetadata())
 	}
 
@@ -992,7 +1217,11 @@ func (v *View) Propose(proposal types.Proposal) {
 		_, prevSigs = v.RetrieveCheckpoint()
 	}
 
-	seq := v.ProposalSequence
+	// The sequence this proposal takes; the next proposal takes the one after it, before this one is delivered.
+	v.seqLock.Lock()
+	seq := v.head
+	v.head++
+	v.seqLock.Unlock()
 	msg := &protos.Message{
 		Content: &protos.Message_PrePrepare{
 			PrePrepare: &protos.PrePrepare{

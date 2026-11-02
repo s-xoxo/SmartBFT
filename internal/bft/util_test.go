@@ -497,3 +497,67 @@ func TestGetLeaderId(t *testing.T) {
 	require.Equal(t, uint64(11), getLeaderID(view, uint64(len(nodes)), nodes, true, 7, decisionsPerLeader, nil))
 	require.Equal(t, uint64(11), getLeaderID(view, uint64(len(nodes)), nodes, true, 8, decisionsPerLeader, nil))
 }
+
+// TestInFlightDataMultiplex covers InFlightData holding several proposals in flight: the getters report the
+// lowest sequence, StorePrepares marks the entry of its own sequence, pruneDelivered forgets the delivered
+// sequences but keeps the highest entry (so with a single entry it keeps what a view data message carries),
+// and clearUpTo forgets everything up to the synced sequence.
+func TestInFlightDataMultiplex(t *testing.T) {
+	proposalAt := func(seq uint64) types.Proposal {
+		return types.Proposal{
+			Payload:  []byte{byte(seq)},
+			Metadata: MarshalOrPanic(&protos.ViewMetadata{ViewId: 1, LatestSequence: seq}),
+		}
+	}
+	const k = uint64(5)
+
+	ifp := &InFlightData{}
+	prop, prepared := ifp.InFlightProposalAndPrepared()
+	require.Nil(t, prop)
+	require.False(t, prepared)
+
+	// Two proposals in flight, the higher one prepared: the lowest one is reported, unprepared.
+	ifp.StoreProposal(proposalAt(k))
+	ifp.StoreProposal(proposalAt(k + 1))
+	ifp.StorePrepares(1, k+1)
+	require.Equal(t, proposalAt(k), *ifp.InFlightProposal())
+	require.False(t, ifp.IsInFlightPrepared())
+	prop, prepared = ifp.InFlightProposalAndPrepared()
+	require.Equal(t, proposalAt(k), *prop)
+	require.False(t, prepared)
+
+	// Delivering k leaves k+1, which is prepared.
+	ifp.pruneDelivered(k)
+	prop, prepared = ifp.InFlightProposalAndPrepared()
+	require.Equal(t, proposalAt(k+1), *prop)
+	require.True(t, prepared)
+
+	// Delivering the only entry keeps it: the sequential case is unchanged.
+	ifp.pruneDelivered(k + 1)
+	prop, prepared = ifp.InFlightProposalAndPrepared()
+	require.Equal(t, proposalAt(k+1), *prop)
+	require.True(t, prepared)
+
+	// With a single entry, preparing an unknown sequence marks that entry (what a single tracked proposal did);
+	// with several entries, or none, it is a programming error, as before.
+	ifp.StoreProposal(proposalAt(k + 2))
+	require.Panics(t, func() { ifp.StorePrepares(1, k+7) })
+	require.False(t, ifp.IsInFlightPrepared() && len(ifp.entries) != 2)
+
+	// Syncing to a sequence forgets everything up to it, the highest entry included.
+	ifp.clearUpTo(k + 1)
+	require.Equal(t, proposalAt(k+2), *ifp.InFlightProposal())
+	ifp.StorePrepares(1, k+9) // the only entry is k+2
+	require.True(t, ifp.IsInFlightPrepared())
+	ifp.clearUpTo(k + 2)
+	require.Nil(t, ifp.InFlightProposal())
+	require.False(t, ifp.IsInFlightPrepared())
+	require.Panics(t, func() { ifp.StorePrepares(1, k) })
+
+	// A proposal without metadata is stored under sequence 0 and marked by StorePrepares(_, 0), as before.
+	ifp.StoreProposal(types.Proposal{Payload: []byte{9}})
+	ifp.StorePrepares(0, 0)
+	require.True(t, ifp.IsInFlightPrepared())
+	ifp.clear()
+	require.Nil(t, ifp.InFlightProposal())
+}
