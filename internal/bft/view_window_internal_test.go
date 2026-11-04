@@ -615,6 +615,42 @@ func TestViewLeaderResendsPrePrepares(t *testing.T) {
 		require.Equal(t, 9, f.comm.broadcastCount())
 	})
 
+	t.Run("depth 2 does not resend prepared sequences", func(t *testing.T) {
+		f := newWindowView(windowLeader, 2)
+		v := f.view
+		tick := make(chan time.Time)
+		v.resendTick = tick
+		v.PrePrepareResendInterval = time.Hour
+		v.Start()
+		defer v.Abort()
+
+		low := windowLow
+		first := windowProposal(low, windowDecisionsFor(low))
+		second := windowProposal(low+1, windowDecisionsFor(low+1))
+		v.Propose(first)
+		v.Propose(second)
+		var originals []*protos.Message
+		for range []uint64{low, low + 1} {
+			originals = append(originals, f.comm.nextBroadcast(t, "a pre-prepare"))
+			f.comm.nextBroadcast(t, "a prepare")
+		}
+
+		// A prepare quorum for the first sequence: the leader commits it, and it is not resent any more,
+		// since every node of the quorum holds its pre-prepare; the second, still open, is.
+		v.HandleMessage(2, prepareMsg(low, first.Digest(), false))
+		v.HandleMessage(3, prepareMsg(low, first.Digest(), false))
+		commit := f.comm.nextBroadcast(t, "the commit of the first sequence")
+		require.NotNil(t, commit.GetCommit())
+		tick <- time.Now()
+		resent := f.comm.nextBroadcast(t, "the resent second pre-prepare")
+		require.True(t, proto.Equal(originals[1], resent), "expected %s, got %s", MsgToString(originals[1]), MsgToString(resent))
+		tick <- time.Now()
+		resent = f.comm.nextBroadcast(t, "the resent second pre-prepare, again")
+		require.True(t, proto.Equal(originals[1], resent))
+		// 2 pre-prepares + 2 prepares, the commit of the first, the second resent twice.
+		require.Equal(t, 7, f.comm.broadcastCount())
+	})
+
 	t.Run("depth 2 creates a ticker from the interval", func(t *testing.T) {
 		f := newWindowView(windowLeader, 2)
 		f.view.PrePrepareResendInterval = time.Hour
@@ -690,6 +726,32 @@ func TestViewDuplicatePrePrepareLogLevel(t *testing.T) {
 		require.Equal(t, zapcore.WarnLevel, f.logs.level(dropped))
 		require.Zero(t, f.logs.count("again, ignoring it"))
 	})
+}
+
+// TestViewPrevSeqPrePrepareLogLevel covers the log level of a pre-prepare for a delivered sequence (section 5):
+// with depth above one it is the leader's periodic resend reaching a node that delivered the sequence
+// meanwhile, so it is debug-logged; with depth 1 it keeps the warning of the sequential view.
+func TestViewPrevSeqPrePrepareLogLevel(t *testing.T) {
+	const prev = "Got pre-prepare for sequence"
+	low := windowLow
+	stale := windowProposal(low-1, windowDecisionsFor(low)-1)
+
+	for _, tc := range []struct {
+		depth uint64
+		level zapcore.Level
+	}{{1, zapcore.WarnLevel}, {2, zapcore.DebugLevel}, {4, zapcore.DebugLevel}} {
+		t.Run(fmt.Sprintf("depth %d", tc.depth), func(t *testing.T) {
+			f := newWindowView(2, tc.depth)
+			v := f.view
+			v.Start()
+			defer v.Abort()
+
+			v.HandleMessage(windowLeader, prePrepareMsg(low-1, stale))
+			f.logs.waitFor(t, fmt.Sprintf("%s %d but we're in sequence %d", prev, low-1, low))
+			require.Equal(t, tc.level, f.logs.level(prev))
+			require.Zero(t, f.comm.broadcastCount(), "a stale pre-prepare is dropped without a reply")
+		})
+	}
 }
 
 // TestViewGetMetadataPredictsDecisions covers I5: the leader's metadata for the sequence it proposes next
