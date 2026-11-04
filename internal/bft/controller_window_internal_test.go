@@ -6,6 +6,7 @@
 package bft
 
 import (
+	"fmt"
 	"sync"
 	"testing"
 
@@ -23,6 +24,7 @@ import (
 // fakeView is a Proposer that records what it is asked to propose.
 type fakeView struct {
 	leader    uint64
+	restored  uint64
 	abortChan chan struct{}
 	stopOnce  sync.Once
 	mu        sync.Mutex
@@ -41,6 +43,8 @@ func (v *fakeView) Propose(proposal types.Proposal) {
 }
 
 func (v *fakeView) Start() {}
+
+func (v *fakeView) RestoredCount() uint64 { return v.restored }
 
 func (v *fakeView) Abort() { v.stop() }
 
@@ -76,12 +80,17 @@ func (v *fakeView) proposals() int {
 
 // fakeProposerBuilder builds fake views led by the requested leader, reporting the configured phase.
 type fakeProposerBuilder struct {
-	phase Phase
-	built []*fakeView
+	phase    Phase
+	restored uint64 // what the built views report as restored; 0 means "one if the phase is PROPOSED/PREPARED"
+	built    []*fakeView
 }
 
 func (b *fakeProposerBuilder) NewProposer(leader, _, _, _ uint64, _ int) (Proposer, Phase) {
 	view := newFakeView(leader)
+	view.restored = b.restored
+	if b.restored == 0 && (b.phase == PROPOSED || b.phase == PREPARED) {
+		view.restored = 1
+	}
 	b.built = append(b.built, view)
 	return view, b.phase
 }
@@ -391,4 +400,20 @@ type assemblerFunc func(metadata []byte, requests [][]byte) types.Proposal
 
 func (f assemblerFunc) AssembleProposal(metadata []byte, requests [][]byte) types.Proposal {
 	return f(metadata, requests)
+}
+
+// TestControllerTokensAfterRestore covers R1 with several restored proposals: a view that starts with m
+// proposals in flight issues W-m tokens, so that len(tokens) + in flight + restored == W, and none when the
+// restore fills the pipeline.
+func TestControllerTokensAfterRestore(t *testing.T) {
+	for _, tc := range []struct{ depth, restored, tokens uint64 }{{3, 2, 1}, {3, 3, 0}, {4, 1, 3}, {1, 1, 0}} {
+		t.Run(fmt.Sprintf("depth %d restored %d", tc.depth, tc.restored), func(t *testing.T) {
+			builder := &fakeProposerBuilder{phase: PREPARED, restored: tc.restored}
+			c, _ := newWindowController(1, tc.depth, builder)
+			c.currViewNumber = 0
+			c.startView(1)
+			require.Len(t, c.leaderToken, int(tc.tokens))
+			c.drainLeaderTokens()
+		})
+	}
 }

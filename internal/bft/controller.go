@@ -74,6 +74,9 @@ type Proposer interface {
 	GetLeaderID() uint64
 	GetMetadata() []byte
 	HandleMessage(sender uint64, m *protos.Message)
+	// RestoredCount is how many proposals in flight the view started with (restored from the WAL, or
+	// carried over by a view change); they occupy that many places of the pipeline.
+	RestoredCount() uint64
 }
 
 // ProposerBuilder builds a new Proposer
@@ -397,13 +400,10 @@ func (c *Controller) startView(proposalSequence uint64) {
 			// another leader or to a view that was being changed.
 			c.BatchTuner.Reset()
 		}
-		// R1: one token per proposal the view may have in flight, less the proposal it restored (a restored
-		// view holds at most one, in phase PROPOSED or PREPARED). With a depth of one this is one token
-		// when nothing was restored, none otherwise, as before.
-		var restored uint64
-		if initPhase == PROPOSED || initPhase == PREPARED {
-			restored = 1
-		}
+		// R1: one token per proposal the view may have in flight, less the proposals it restored, so that
+		// len(tokens) + in flight + restored == W. With a depth of one this is one token when nothing was
+		// restored, none otherwise, as before.
+		restored := min(view.RestoredCount(), c.depth())
 		if tokens := c.depth() - restored; tokens > 0 {
 			c.Logger.Debugf("Acquiring leader token when starting view with phase %s", initPhase.String())
 			c.acquireLeaderTokens(view, tokens)
