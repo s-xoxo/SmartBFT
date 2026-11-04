@@ -119,15 +119,6 @@ func (c *Consensus) Start() error {
 		return fmt.Errorf("configuration is invalid: %w", err)
 	}
 
-	// Restoring proposals in flight from the WAL is implemented for one proposal in flight only; with a
-	// deeper pipeline the restore would forget the other proposals in flight, so it is refused explicitly.
-	if depth := c.Config.EffectivePipelineDepth(); depth > 1 {
-		if seq, inFlight := algorithm.InFlightSequenceInWAL(c.WALInitialContent, c.Metadata.GetLatestSequence()); inFlight {
-			return fmt.Errorf("the WAL holds a proposal with sequence %d in flight, which cannot be restored with PipelineDepthMax %d: "+
-				"restarting with proposals in flight is supported only with a pipeline depth of one", seq, depth)
-		}
-	}
-
 	if c.Metrics == nil {
 		c.Metrics = bft.NewMetrics(&disabled.Provider{})
 	}
@@ -149,6 +140,7 @@ func (c *Consensus) Start() error {
 		Entries:          c.WALInitialContent,
 		Logger:           c.Logger,
 		WAL:              c.WAL,
+		Metrics:          c.Metrics.MetricsState,
 	}
 
 	c.checkpoint = &types.Checkpoint{}

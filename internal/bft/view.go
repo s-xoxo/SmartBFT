@@ -115,6 +115,10 @@ type View struct {
 	inFlightProposal  *types.Proposal
 	inFlightRequests  []types.RequestInfo
 	lastBroadcastSent *protos.Message
+	// restored is the hand-off of a restore from the WAL with a pipeline: the proposals in flight, lowest
+	// first (state.go). Start moves them into their slots; restoredCount keeps how many for the controller.
+	restored      []*restoredSlot
+	restoredCount uint64
 	// seqLock guards ProposalSequence, DecisionsInView and head between the view goroutine, which
 	// writes them, and the leader's proposer goroutine, which reads them in GetMetadata and Propose.
 	seqLock sync.Mutex
@@ -249,9 +253,31 @@ func (v *View) setup() {
 	v.verifiedSigs = make(chan verifiedSig, int(v.N)*(2*int(v.depth())+2))
 	v.head = v.ProposalSequence
 
-	if v.Phase == PROPOSED || v.Phase == PREPARED {
-		// A proposal restored from the WAL, or the in-flight proposal of a view change,
-		// is the proposal of the lowest sequence; it has not been proposed to anyone by this view.
+	switch {
+	case len(v.restored) > 0:
+		// The proposals in flight restored from the WAL, lowest first and contiguous from ProposalSequence.
+		// A restored leader keeps their pre-prepares, to broadcast them again to the followers that missed
+		// them (resendPrePrepares, depth above one only).
+		for _, r := range v.restored {
+			slot := v.slot(r.seq)
+			slot.proposal = r.proposal
+			slot.requests = r.requests
+			slot.lastBroadcastSent = r.lastBroadcastSent()
+			slot.mySig = r.mySig()
+			slot.phase = slotProposed
+			if r.commit != nil {
+				slot.phase = slotPrepared
+			}
+			if v.SelfID == v.LeaderID {
+				slot.prePrepare = r.prePrepare()
+			}
+		}
+		v.head = v.restored[len(v.restored)-1].seq + 1
+		v.restoredCount = uint64(len(v.restored))
+		v.restored = nil
+	case v.Phase == PROPOSED || v.Phase == PREPARED:
+		// The in-flight proposal of a view change (viewchanger.go) is the proposal of the lowest sequence;
+		// it has not been proposed to anyone by this view.
 		slot := v.slot(v.ProposalSequence)
 		slot.proposal = v.inFlightProposal
 		slot.requests = v.inFlightRequests
@@ -262,6 +288,9 @@ func (v *View) setup() {
 			slot.phase = slotPrepared
 		}
 		v.head = v.ProposalSequence + 1
+		v.restoredCount = 1
+	default:
+		v.restoredCount = 0
 	}
 
 	if v.resendTick == nil && v.depth() > 1 && v.SelfID == v.LeaderID && v.PrePrepareResendInterval > 0 {
@@ -539,6 +568,12 @@ func (v *View) resendPrePrepares() {
 	}
 }
 
+// RestoredCount returns how many proposals in flight the view started with: restored from the WAL, or the
+// one carried over by a view change. The leader issues that many tokens less (R1).
+func (v *View) RestoredCount() uint64 {
+	return v.restoredCount
+}
+
 // inFlightCount returns how many sequences the leader proposed and has not delivered yet.
 func (v *View) inFlightCount() uint64 {
 	v.seqLock.Lock()
@@ -618,9 +653,12 @@ func (v *View) processProposal(slot *seqState) bool {
 
 	prepareMessage := v.createPrepare(seq, proposal)
 
-	// We are about to send a prepare for a pre-prepare,
-	// so we record the pre-prepare. The record starts a new proposal pair,
-	// hence everything written before it may be truncated.
+	// We are about to send a prepare for a pre-prepare, so we record the pre-prepare. The record of the
+	// lowest open sequence starts the set of records a restart needs, hence everything written before it
+	// may be truncated; the record of a higher sequence of the window must keep the lower ones next to it.
+	// With a depth of one the processed sequence is always the lowest, so the record always truncates, as
+	// it did. Restore drops the records of the sequences delivered since (the checkpoint filter), which is
+	// what makes this truncation point exact.
 	savedMsg := &protos.SavedMessage{
 		Content: &protos.SavedMessage_ProposedRecord{
 			ProposedRecord: &protos.ProposedRecord{
@@ -629,7 +667,7 @@ func (v *View) processProposal(slot *seqState) bool {
 			},
 		},
 	}
-	if err = v.State.Save(savedMsg, true); err != nil {
+	if err = v.State.Save(savedMsg, seq == v.ProposalSequence); err != nil {
 		v.Logger.Panicf("Failed to save message to state, error: %v", err)
 	}
 	slot.lastBroadcastSent = prepareMessage

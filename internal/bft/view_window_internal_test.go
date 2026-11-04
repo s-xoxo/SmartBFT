@@ -157,15 +157,30 @@ func (d *fakeDecider) next(t *testing.T, what string) decisionRecord {
 
 // fakeState records the saved messages under a lock.
 type fakeState struct {
-	mu    sync.Mutex
-	saved []*protos.SavedMessage
+	mu       sync.Mutex
+	saved    []*protos.SavedMessage
+	truncate []bool // the truncation flag of every record saved
 }
 
-func (s *fakeState) Save(message *protos.SavedMessage, _ bool) error {
+func (s *fakeState) Save(message *protos.SavedMessage, truncateTo bool) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.saved = append(s.saved, message)
+	s.truncate = append(s.truncate, truncateTo)
 	return nil
+}
+
+// truncateFlags returns the truncation flag of every pre-prepare record saved, in order.
+func (s *fakeState) truncateFlags() []bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var flags []bool
+	for i, m := range s.saved {
+		if m.GetProposedRecord() != nil {
+			flags = append(flags, s.truncate[i])
+		}
+	}
+	return flags
 }
 
 func (*fakeState) Restore(*View) error { panic("should not be used") }
@@ -785,45 +800,122 @@ func TestViewGetMetadataPredictsDecisions(t *testing.T) {
 	require.Equal(t, 1, follower.logs.count("Expected proposal sequence 6 but got 7"))
 }
 
-// TestInFlightSequenceInWAL covers the check a node with a pipeline depth above one makes before starting:
-// a WAL that ends with a pre-prepare, or with a commit after its pre-prepare, of a sequence above the last
-// decided one holds a proposal in flight.
-func TestInFlightSequenceInWAL(t *testing.T) {
-	proposed := func(seq uint64) []byte {
-		return MarshalOrPanic(&protos.SavedMessage{Content: &protos.SavedMessage_ProposedRecord{
-			ProposedRecord: &protos.ProposedRecord{
-				PrePrepare: &protos.PrePrepare{View: 1, Seq: seq, Proposal: &protos.Proposal{}},
-				Prepare:    &protos.Prepare{View: 1, Seq: seq},
-			},
-		}})
-	}
-	commit := func(seq uint64) []byte {
-		return MarshalOrPanic(&protos.SavedMessage{Content: &protos.SavedMessage_Commit{
-			Commit: commitMsg(seq, "d", 1, false),
-		}})
-	}
-	newView := MarshalOrPanic(&protos.SavedMessage{Content: &protos.SavedMessage_NewView{NewView: &protos.ViewMetadata{ViewId: 2}}})
+// TestViewTruncatesAtLowestOpenSequence covers the truncation rule (design-state-wal-window.md section 4):
+// the pre-prepare record truncates the WAL only when its sequence is the lowest open one, so that the
+// records of the lower sequences still in flight survive next to it. With depth 1 every record truncates.
+func TestViewTruncatesAtLowestOpenSequence(t *testing.T) {
+	t.Run("depth 3", func(t *testing.T) {
+		f := newWindowView(2, 3)
+		v := f.view
+		v.Start()
+		defer v.Abort()
 
-	for _, tc := range []struct {
-		description string
-		entries     [][]byte
-		lastDecided uint64
-		seq         uint64
-		inFlight    bool
-	}{
-		{description: "empty"},
-		{description: "garbage", entries: [][]byte{{1, 2, 3}}},
-		{description: "new view", entries: [][]byte{proposed(5), newView}, lastDecided: 4},
-		{description: "pre-prepare in flight", entries: [][]byte{proposed(5)}, lastDecided: 4, seq: 5, inFlight: true},
-		{description: "pre-prepare already decided", entries: [][]byte{proposed(5)}, lastDecided: 5},
-		{description: "prepared in flight", entries: [][]byte{proposed(5), commit(5)}, lastDecided: 4, seq: 5, inFlight: true},
-		{description: "prepared and decided", entries: [][]byte{proposed(5), commit(5)}, lastDecided: 5},
-		{description: "commit without pre-prepare", entries: [][]byte{commit(5)}, lastDecided: 4},
-	} {
-		t.Run(tc.description, func(t *testing.T) {
-			seq, inFlight := InFlightSequenceInWAL(tc.entries, tc.lastDecided)
-			require.Equal(t, tc.inFlight, inFlight)
-			require.Equal(t, tc.seq, seq)
-		})
+		low := windowLow
+		proposals := make([]types.Proposal, 4)
+		for i := range proposals {
+			seq := low + uint64(i)
+			proposals[i] = windowProposal(seq, windowDecisionsFor(seq))
+		}
+		v.HandleMessage(windowLeader, prePrepareMsg(low, proposals[0]))
+		v.HandleMessage(windowLeader, prePrepareMsg(low+1, proposals[1]))
+		f.comm.nextBroadcast(t, "the prepare of low")
+		f.comm.nextBroadcast(t, "the prepare of low+1")
+		require.Equal(t, []bool{true, false}, f.state.truncateFlags(), "only the lowest open sequence truncates")
+
+		// low is delivered while low+1 stays open: the next pre-prepare must not truncate either.
+		f.prepareAndCommit(t, low, proposals[0].Digest(), 3, 4)
+		f.decider.next(t, "the decision of low")
+		v.HandleMessage(windowLeader, prePrepareMsg(low+2, proposals[2]))
+		f.comm.nextBroadcast(t, "the prepare of low+2")
+		require.Equal(t, []bool{true, false, false}, f.state.truncateFlags())
+
+		// low+1 and low+2 delivered: the window is empty again and low+3 truncates.
+		f.prepareAndCommit(t, low+1, proposals[1].Digest(), 3, 4)
+		f.decider.next(t, "the decision of low+1")
+		f.prepareAndCommit(t, low+2, proposals[2].Digest(), 3, 4)
+		f.decider.next(t, "the decision of low+2")
+		v.HandleMessage(windowLeader, prePrepareMsg(low+3, proposals[3]))
+		f.comm.nextBroadcast(t, "the prepare of low+3")
+		require.Equal(t, []bool{true, false, false, true}, f.state.truncateFlags())
+	})
+
+	t.Run("depth 1 always truncates", func(t *testing.T) {
+		f := newWindowView(2, 1)
+		v := f.view
+		v.Start()
+		defer v.Abort()
+
+		low := windowLow
+		for i := range uint64(3) {
+			seq := low + i
+			proposal := windowProposal(seq, windowDecisionsFor(seq))
+			v.HandleMessage(windowLeader, prePrepareMsg(seq, proposal))
+			f.comm.nextBroadcast(t, "the prepare")
+			f.prepareAndCommit(t, seq, proposal.Digest(), 3, 4)
+			f.decider.next(t, "the decision")
+		}
+		require.Equal(t, []bool{true, true, true}, f.state.truncateFlags())
+	})
+}
+
+// restoredSlotFor builds the hand-off of a restore for the given sequence, prepared when commit is set.
+func restoredSlotFor(seq uint64, proposal types.Proposal, prepared bool) *restoredSlot {
+	pp := prePrepareMsg(seq, proposal).GetPrePrepare()
+	r := &restoredSlot{
+		seq:             seq,
+		view:            windowView,
+		decisionsInView: windowDecisionsFor(seq),
+		proposal:        &proposal,
+		requests:        windowRequests,
+		proposed:        &protos.ProposedRecord{PrePrepare: pp, Prepare: prepareMsg(seq, proposal.Digest(), false).GetPrepare()},
 	}
+	if prepared {
+		r.commit = commitMsg(seq, proposal.Digest(), windowLeader, false)
+	}
+	return r
+}
+
+// TestViewStartsFromRestoredSlots covers the hand-off of several restored proposals (design-state-wal-window.md
+// section 5, step 6): Start turns them into slots in their phases, broadcasts their prepare or commit again,
+// reports their count, and a restored leader broadcasts again the pre-prepares of the ones below a prepare
+// quorum on every tick, as it does for the ones it proposed itself.
+func TestViewStartsFromRestoredSlots(t *testing.T) {
+	f := newWindowView(windowLeader, 3)
+	v := f.view
+	tick := make(chan time.Time)
+	v.resendTick = tick
+	v.PrePrepareResendInterval = time.Hour
+
+	low := windowLow
+	first := windowProposal(low, windowDecisionsFor(low))
+	second := windowProposal(low+1, windowDecisionsFor(low+1))
+	v.restored = []*restoredSlot{restoredSlotFor(low, first, true), restoredSlotFor(low+1, second, false)}
+	v.Phase = PREPARED
+	v.Start()
+	defer v.Abort()
+
+	require.Equal(t, uint64(2), v.RestoredCount())
+	require.Equal(t, uint64(2), v.inFlightCount())
+	commit := f.comm.nextBroadcast(t, "the commit of the prepared sequence")
+	require.NotNil(t, commit.GetCommit())
+	require.Equal(t, low, commit.GetCommit().GetSeq())
+	prepare := f.comm.nextBroadcast(t, "the prepare of the proposed sequence")
+	require.NotNil(t, prepare.GetPrepare())
+	require.Equal(t, low+1, prepare.GetPrepare().GetSeq())
+
+	// Only the sequence without a prepare quorum is resent.
+	tick <- time.Now()
+	resent := f.comm.nextBroadcast(t, "the resent pre-prepare")
+	require.NotNil(t, resent.GetPrePrepare())
+	require.Equal(t, low+1, resent.GetPrePrepare().GetSeq())
+	require.True(t, proto.Equal(prePrepareMsg(low+1, second), resent))
+	require.Equal(t, 3, f.comm.broadcastCount())
+
+	// The restored sequences complete as the view's own would, in order.
+	f.prepareAndCommit(t, low+1, second.Digest(), 3, 4)
+	for _, sender := range []uint64{3, 4} {
+		v.HandleMessage(sender, commitMsg(low, first.Digest(), sender, false))
+	}
+	require.Equal(t, first, f.decider.next(t, "the first decision").proposal)
+	require.Equal(t, second, f.decider.next(t, "the second decision").proposal)
 }

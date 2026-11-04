@@ -94,6 +94,7 @@ type Metrics struct {
 	MetricsConsensus   *MetricsConsensus
 	MetricsView        *MetricsView
 	MetricsViewChange  *MetricsViewChange
+	MetricsState       *MetricsState
 }
 
 func NewMetrics(p metrics.Provider, labelNames ...string) *Metrics {
@@ -104,6 +105,7 @@ func NewMetrics(p metrics.Provider, labelNames ...string) *Metrics {
 		MetricsConsensus:   NewMetricsConsensus(p, labelNames...),
 		MetricsView:        NewMetricsView(p, labelNames...),
 		MetricsViewChange:  NewMetricsViewChange(p, labelNames...),
+		MetricsState:       NewMetricsState(p, labelNames...),
 	}
 }
 
@@ -115,6 +117,7 @@ func (m *Metrics) With(labelValues ...string) *Metrics {
 		MetricsConsensus:   m.MetricsConsensus.With(labelValues...),
 		MetricsView:        m.MetricsView.With(labelValues...),
 		MetricsViewChange:  m.MetricsViewChange.With(labelValues...),
+		MetricsState:       m.MetricsState.With(labelValues...),
 	}
 }
 
@@ -125,6 +128,39 @@ func (m *Metrics) Initialize(nodes []uint64) {
 	m.MetricsConsensus.Initialize()
 	m.MetricsView.Initialize()
 	m.MetricsViewChange.Initialize()
+	m.MetricsState.Initialize()
+}
+
+// walRecordsSinceBoundaryOpts is the number of WAL records since the last truncation point, that one
+// included: what a restart reads back. With a single proposal in flight at a time it is 1 or 2; with a
+// pipeline it grows while the lowest open sequence stays open.
+var walRecordsSinceBoundaryOpts = metrics.GaugeOpts{
+	Namespace:    "consensus",
+	Subsystem:    "smartbft",
+	Name:         "wal_records_since_boundary",
+	Help:         "Number of WAL records since the last truncation point, which a restart would read back.",
+	LabelNames:   []string{},
+	StatsdFormat: "%{#fqname}",
+}
+
+// MetricsState encapsulates the metrics of the persisted state (the records written to the WAL).
+type MetricsState struct {
+	RecordsSinceBoundary metrics.Gauge
+}
+
+// NewMetricsState create new state metrics
+func NewMetricsState(p metrics.Provider, labelNames ...string) *MetricsState {
+	return &MetricsState{
+		RecordsSinceBoundary: p.NewGauge(NewGaugeOpts(walRecordsSinceBoundaryOpts, labelNames)),
+	}
+}
+
+func (m *MetricsState) With(labelValues ...string) *MetricsState {
+	return &MetricsState{RecordsSinceBoundary: m.RecordsSinceBoundary.With(labelValues...)}
+}
+
+func (m *MetricsState) Initialize() {
+	m.RecordsSinceBoundary.Add(0)
 }
 
 var countOfRequestPoolOpts = metrics.GaugeOpts{
