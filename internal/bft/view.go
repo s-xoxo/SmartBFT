@@ -524,13 +524,15 @@ func (v *View) acceptVerifiedSig(vs verifiedSig) {
 }
 
 // resendPrePrepares broadcasts again the pre-prepares of the sequences this leader proposed and has not
-// seen committed, so that a follower that missed one fills the gap and prepares what is above it. A sequence
-// that is committed here was accepted by a quorum; a node that lacks it catches up through the previous
-// sequence messages or through sync, as it always did.
+// seen a prepare quorum for, so that a follower that missed one fills the gap and prepares what is above it.
+// A sequence that is prepared here was accepted by a quorum, which no longer needs the pre-prepare and, with
+// the prefix rule, holds every pre-prepare below it too; a node outside that quorum catches up through the
+// previous sequence messages or through sync, as it always did. Resending the prepared sequences as well
+// would only reach nodes that have them, and some that have already delivered them.
 func (v *View) resendPrePrepares() {
 	for seq := v.ProposalSequence; seq < v.head; seq++ {
 		slot := v.slots[seq]
-		if slot == nil || slot.prePrepare == nil || slot.phase >= slotCommitted {
+		if slot == nil || slot.prePrepare == nil || slot.phase >= slotPrepared {
 			continue
 		}
 		v.Comm.BroadcastConsensus(slot.prePrepare)
@@ -943,6 +945,12 @@ func (v *View) verifyBlacklist(prevCommitSignatures []*protos.Signature, currVer
 
 func (v *View) handlePrevSeqMessage(msgProposalSeq, sender uint64, m *protos.Message) {
 	if m.GetPrePrepare() != nil {
+		if v.depth() > 1 {
+			// The leader of a pipelined view broadcasts its open pre-prepares again periodically, and one
+			// of them may reach a node that delivered the sequence meanwhile: expected, not a warning.
+			v.Logger.Debugf("Got pre-prepare for sequence %d but we're in sequence %d", msgProposalSeq, v.ProposalSequence)
+			return
+		}
 		v.Logger.Warnf("Got pre-prepare for sequence %d but we're in sequence %d", msgProposalSeq, v.ProposalSequence)
 		return
 	}
