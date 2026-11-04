@@ -1853,6 +1853,8 @@ func (*fakeProposer) Propose(types.Proposal) {}
 
 func (*fakeProposer) Start() {}
 
+func (*fakeProposer) RestoredCount() uint64 { return 0 }
+
 func (p *fakeProposer) Abort() {
 	p.abortOnce.Do(func() {
 		close(p.abortChan)

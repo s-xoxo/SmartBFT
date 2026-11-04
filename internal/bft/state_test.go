@@ -77,7 +77,7 @@ func TestStateRestore(t *testing.T) {
 			WALContent: [][]byte{
 				bft.MarshalOrPanic(preparedProof),
 			},
-			expectedError: "last message is a commit, but expected to also have a matching pre-prepare",
+			expectedError: "the WAL holds a commit of sequence 200, but expected to also have a matching pre-prepare",
 		},
 		{
 			description:         "prepared but not committed",
@@ -115,7 +115,7 @@ func TestStateRestore(t *testing.T) {
 				bft.MarshalOrPanic(preparedProof),
 			},
 			expectedError: "last proposal sequence persisted into WAL is 200" +
-				" which is greater than last committed sequence is 199",
+				" which is greater than last committed sequence 198 plus the pipeline depth 1",
 		},
 		{
 			description:   "malformed prepared but valid commit",
@@ -124,7 +124,7 @@ func TestStateRestore(t *testing.T) {
 				{1, 2, 3},
 				bft.MarshalOrPanic(preparedProof),
 			},
-			expectedError: "failed unmarshaling last entry from WAL: " +
+			expectedError: "failed unmarshaling entry 1 of 2 from WAL: " +
 				"proto:",
 		},
 		{
@@ -134,7 +134,7 @@ func TestStateRestore(t *testing.T) {
 				bft.MarshalOrPanic(&protos.SavedMessage{Content: nil}),
 				bft.MarshalOrPanic(preparedProof),
 			},
-			expectedError: "expected second last message to be a pre-prepare, but got '' instead",
+			expectedError: "unrecognized record: ",
 		},
 	} {
 		t.Run(testCase.description, func(t *testing.T) {

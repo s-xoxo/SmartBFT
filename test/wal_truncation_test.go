@@ -246,7 +246,10 @@ func TestRestartKeepsViewAndInFlightProposal(t *testing.T) {
 		}
 	})
 
-	isolated.Restart()
+	// Restart without a sync: a sync would deliver the decision the others reached, and a proposal the
+	// application has delivered is not in flight any more, so the restore would (rightly) drop it. The
+	// scenario of this test is the crash of a node that has not learned of the decision yet.
+	isolated.RestartSync(false)
 
 	waitForSignal(t, restoredProposal, "the node to restore the proposal in flight")
 

@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -20,9 +21,10 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-// These tests run the pipeline with PipelineDepthMax above one (design-pipeline-window.md section 11.2):
-// several proposals in flight, delivery in order, the leader bounded by the window, and the explicit refusal
-// to restart with proposals in flight. Every request is its own proposal (RequestBatchMaxCount = 1).
+// These tests run the pipeline with PipelineDepthMax above one (design-pipeline-window.md section 11.2,
+// design-state-wal-window.md section 9): several proposals in flight, delivery in order, the leader bounded by
+// the window, and restarts with proposals in flight restored from the WAL. Every request is its own proposal
+// (RequestBatchMaxCount = 1).
 
 // windowLogs keeps the log entries of every node of a cluster, so a test can count them and wait for one.
 type windowLogs struct {
@@ -296,45 +298,120 @@ func TestPipelineLeaderStopsAtWindow(t *testing.T) {
 	requireNoDrops(t, c.logs, 4)
 }
 
-// stoppedHandler stands in for a node whose consensus refused to start, so that the network can shut down.
-type stoppedHandler struct{}
-
-func (stoppedHandler) HandleMessage(uint64, *smartbftprotos.Message) {}
-func (stoppedHandler) HandleRequest(uint64, []byte)                  {}
-func (stoppedHandler) Stop()                                         {}
-
-// TestPipelineRestartWithInFlightIsRejected covers the explicit refusal to restart with a proposal in flight
-// when the pipeline depth is above one: a node that persisted a pre-prepare and never decided it gets an error
-// from Consensus.Start (no panic) that names the sequence and the depth.
-func TestPipelineRestartWithInFlightIsRejected(t *testing.T) {
+// TestPipelineRestartRestoresInFlight covers the restore of several proposals in flight (merge criterion of
+// feat/state-wal-window): a node that persisted two pre-prepares and never decided them restarts, reads both
+// back from the WAL ("Restored 2 proposals in flight"), and once its messages flow again delivers the same
+// records as the others, in order.
+func TestPipelineRestartRestoresInFlight(t *testing.T) {
 	t.Parallel()
+	var losing atomic.Bool
+	losing.Store(true)
 	c := newWindowCluster(t, 3, func(n *App) {
 		if n.ID == 4 {
-			// The node accepts pre-prepares only, so it persists the proposal and never decides it.
+			// The node accepts pre-prepares only, so it persists the proposals and never decides them.
 			n.LoseMessages(func(msg *smartbftprotos.Message) bool {
-				return msg.GetPrePrepare() == nil
+				return losing.Load() && msg.GetPrePrepare() == nil
 			})
 		}
 	})
 	defer c.network.Shutdown()
 
-	c.submit(1)
-	for _, n := range c.nodes[:3] {
-		select {
-		case <-n.Delivered:
-		case <-time.After(30 * time.Second):
-			t.Fatalf("node %d did not deliver", n.ID)
+	c.submit(2)
+	records := make([][]*AppRecord, 4)
+	for i, n := range c.nodes[:3] {
+		for range 2 {
+			select {
+			case r := <-n.Delivered:
+				records[i] = append(records[i], r)
+			case <-time.After(30 * time.Second):
+				t.Fatalf("node %d did not deliver", n.ID)
+			}
 		}
 	}
 	isolated := c.nodes[3]
 	c.logs.waitFor(t, 4, "Processed proposal with seq 1")
+	c.logs.waitFor(t, 4, "Processed proposal with seq 2")
+	require.Zero(t, c.logs.count(4, "Deciding on seq"))
 
-	err := isolated.TryRestart()
-	require.Error(t, err, "a restart with a proposal in flight must be refused when the depth is above one")
-	require.Contains(t, err.Error(), "sequence 1 in flight")
-	require.Contains(t, err.Error(), "PipelineDepthMax 3")
-	require.Equal(t, uint64(0), isolated.Consensus.GetLeaderID(), "the consensus must not be running")
+	// Restart without a sync, so that the WAL, not the other nodes, is what the node resumes from.
+	losing.Store(false)
+	isolated.RestartSync(false)
+	c.logs.waitFor(t, 4, "Restored 2 proposals in flight, sequences 1 to 2")
+	require.Equal(t, 1, c.logs.count(4, "Restored proposal with sequence 1"))
+	require.Equal(t, 1, c.logs.count(4, "Restored proposal with sequence 2"))
 
-	// The refused consensus never started, so it must not be stopped with the network.
-	c.network.AddOrUpdateNode(isolated.ID, stoppedHandler{}, isolated)
+	// The restored prepares reach nodes that delivered the sequences; they answer from their slots and the
+	// node completes both sequences from where it stopped.
+	for range 2 {
+		select {
+		case r := <-isolated.Delivered:
+			records[3] = append(records[3], r)
+		case <-time.After(60 * time.Second):
+			t.Fatalf("the restarted node delivered %d of 2 records", len(records[3]))
+		}
+	}
+	requireIdenticalInOrder(t, records, 1)
+
+	// And it takes part in what follows.
+	c.submit(3)
+	requireIdenticalInOrder(t, c.collect(3), 3)
+}
+
+// TestPipelineLeaderRestartWithInFlight covers the restored leader: with the followers' commits held it has
+// two proposals in flight, prepared, when it restarts. It restores both, issues W-2 = 1 token (so it proposes
+// exactly one more sequence before any decision), and once the commits flow every node delivers the four
+// sequences identically.
+func TestPipelineLeaderRestartWithInFlight(t *testing.T) {
+	t.Parallel()
+	c := newWindowCluster(t, 3, nil)
+	defer c.network.Shutdown()
+
+	// The commits are held for the whole scenario, which must stay well below the request complain timeout.
+	release := holdCommits(c.nodes, []uint64{2, 3, 4}, []uint64{1, 2, 3, 4})
+	c.submit(2)
+	// The leader reaches a prepare quorum for both (its commit records are the last it writes).
+	c.logs.waitFor(t, 1, "Processed prepares for proposal with seq 1")
+	c.logs.waitFor(t, 1, "Processed prepares for proposal with seq 2")
+	require.Zero(t, c.logs.count(1, "Deciding on seq"))
+
+	leader := c.nodes[0]
+	leader.RestartSync(false)
+	c.logs.waitFor(t, 1, "Restored 2 proposals in flight, sequences 1 to 2")
+
+	// One token left: the third request is proposed, the fourth waits for a decision.
+	c.submit(2)
+	c.logs.waitFor(t, 1, "Proposing proposal sequence 3 in view 0")
+	time.Sleep(300 * time.Millisecond)
+	require.Zero(t, c.logs.count(1, "Proposing proposal sequence 4"), "the restored leader exceeded its window")
+	require.Zero(t, c.logs.count(1, "Deciding on seq"))
+
+	release()
+	records := c.collect(4)
+	requireIdenticalInOrder(t, records, 1)
+	c.logs.waitFor(t, 1, "Proposing proposal sequence 4 in view 0")
+}
+
+// TestPipelineRestartAfterDeliveryStartsClean covers the checkpoint filter: a leader that restarts right after
+// delivering a sequence finds its records after the truncation point, drops them as delivered, restores nothing,
+// and issues W tokens: three requests become three proposals in flight before any decision.
+func TestPipelineRestartAfterDeliveryStartsClean(t *testing.T) {
+	t.Parallel()
+	c := newWindowCluster(t, 3, nil)
+	defer c.network.Shutdown()
+
+	c.submit(1)
+	requireIdenticalInOrder(t, c.collect(1), 1)
+
+	leader := c.nodes[0]
+	leader.RestartSync(false)
+	c.logs.waitFor(t, 1, "Last proposal with sequence 1 has been safely committed")
+	c.logs.waitFor(t, 1, "Every proposal in the WAL was delivered already, nothing in flight to restore")
+	require.Zero(t, c.logs.count(1, "Restored proposal"))
+
+	release := holdCommits(c.nodes, []uint64{2, 3, 4}, []uint64{1, 2, 3, 4})
+	c.submit(3)
+	c.logs.waitFor(t, 1, "Proposing proposal sequence 4 in view 0")
+	require.Equal(t, 1, c.logs.count(1, "Deciding on seq"), "three proposals must be in flight before any decision after the restart")
+	release()
+	requireIdenticalInOrder(t, c.collect(3), 2)
 }
