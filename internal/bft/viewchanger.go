@@ -495,6 +495,7 @@ func (v *ViewChanger) prepareViewDataMsg() *protos.Message {
 			vd.InFlightProposal, vd.InFlightPrepared = entries[0].GetProposal(), entries[0].GetPrepared()
 		}
 	}
+	v.Logger.Debugf("Node %d reports %d proposals in flight in its view data for view %d", v.SelfID, len(vd.GetInFlight()), v.currView)
 	vdBytes := MarshalOrPanic(vd)
 	sig := v.Signer.Sign(vdBytes)
 	msg := &protos.Message{

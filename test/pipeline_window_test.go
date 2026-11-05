@@ -81,7 +81,14 @@ func (l *windowLogs) maxInFlight() int {
 
 func (l *windowLogs) waitFor(t *testing.T, id uint64, substr string) {
 	t.Helper()
-	deadline := time.After(30 * time.Second)
+	l.waitForWithin(t, id, substr, 30*time.Second)
+}
+
+// waitForWithin is waitFor with its own deadline, for events that wait on a heartbeat period or a view-change
+// timeout rather than on message round trips.
+func (l *windowLogs) waitForWithin(t *testing.T, id uint64, substr string, within time.Duration) {
+	t.Helper()
+	deadline := time.After(within)
 	for l.count(id, substr) == 0 {
 		select {
 		case <-l.notify:
@@ -99,6 +106,9 @@ type windowCluster struct {
 	nodes   []*App
 	logs    *windowLogs
 	nextID  int
+	// delivered keeps, per node (1-based), every record the collect helpers took from its Delivered channel.
+	deliveredMu sync.Mutex
+	delivered   map[int][]*AppRecord
 }
 
 func newWindowCluster(t *testing.T, depth uint64, prepare func(n *App)) *windowCluster {
@@ -110,7 +120,7 @@ func newWindowCluster(t *testing.T, depth uint64, prepare func(n *App)) *windowC
 	cfg.DecisionsPerLeader = 0
 	cfg.RequestBatchMaxCount = 1 // one request is one proposal
 
-	c := &windowCluster{t: t, network: NewNetwork(), logs: newWindowLogs()}
+	c := &windowCluster{t: t, network: NewNetwork(), logs: newWindowLogs(), delivered: make(map[int][]*AppRecord)}
 	testDir := t.TempDir()
 	for i := 1; i <= 4; i++ {
 		n := newNodeWithConfig(uint64(i), c.network, t.Name(), testDir, cfg)
@@ -133,6 +143,19 @@ func (c *windowCluster) submit(count int) {
 	}
 }
 
+func (c *windowCluster) remember(node int, r *AppRecord) {
+	c.deliveredMu.Lock()
+	defer c.deliveredMu.Unlock()
+	c.delivered[node] = append(c.delivered[node], r)
+}
+
+// deliveredSoFar returns the records the given node (1-based) delivered so far in this test, in order.
+func (c *windowCluster) deliveredSoFar(node int) []*AppRecord {
+	c.deliveredMu.Lock()
+	defer c.deliveredMu.Unlock()
+	return c.delivered[node]
+}
+
 // collect waits until every node delivered count more records and returns them per node.
 func (c *windowCluster) collect(count int) [][]*AppRecord {
 	c.t.Helper()
@@ -142,6 +165,7 @@ func (c *windowCluster) collect(count int) [][]*AppRecord {
 			select {
 			case r := <-n.Delivered:
 				records[i] = append(records[i], r)
+				c.remember(i+1, r)
 			case <-time.After(60 * time.Second):
 				c.t.Fatalf("node %d delivered %d of %d records", n.ID, len(records[i]), count)
 			}
