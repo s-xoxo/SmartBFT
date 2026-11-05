@@ -426,6 +426,7 @@ func (c *Consensus) createComponents() {
 		Checkpoint:         c.checkpoint,
 		InFlight:           c.inFlight,
 		State:              c.state,
+		PipelineDepth:      c.Config.EffectivePipelineDepth(),
 		// Controller later
 		// RequestsTimer later
 		Ticker:            c.ViewChangerTicker,

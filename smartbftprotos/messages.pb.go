@@ -596,6 +596,59 @@ func (x *ViewChange) GetReason() string {
 	return ""
 }
 
+// InFlightEntry is one proposal a node had in flight when the view changed, and whether it had prepared it.
+type InFlightEntry struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Proposal      *Proposal              `protobuf:"bytes,1,opt,name=proposal,proto3" json:"proposal,omitempty"`
+	Prepared      bool                   `protobuf:"varint,2,opt,name=prepared,proto3" json:"prepared,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *InFlightEntry) Reset() {
+	*x = InFlightEntry{}
+	mi := &file_smartbftprotos_messages_proto_msgTypes[7]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *InFlightEntry) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*InFlightEntry) ProtoMessage() {}
+
+func (x *InFlightEntry) ProtoReflect() protoreflect.Message {
+	mi := &file_smartbftprotos_messages_proto_msgTypes[7]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use InFlightEntry.ProtoReflect.Descriptor instead.
+func (*InFlightEntry) Descriptor() ([]byte, []int) {
+	return file_smartbftprotos_messages_proto_rawDescGZIP(), []int{7}
+}
+
+func (x *InFlightEntry) GetProposal() *Proposal {
+	if x != nil {
+		return x.Proposal
+	}
+	return nil
+}
+
+func (x *InFlightEntry) GetPrepared() bool {
+	if x != nil {
+		return x.Prepared
+	}
+	return false
+}
+
 type ViewData struct {
 	state                  protoimpl.MessageState `protogen:"open.v1"`
 	NextView               uint64                 `protobuf:"varint,1,opt,name=next_view,json=nextView,proto3" json:"next_view,omitempty"`
@@ -603,13 +656,17 @@ type ViewData struct {
 	LastDecisionSignatures []*Signature           `protobuf:"bytes,3,rep,name=last_decision_signatures,json=lastDecisionSignatures,proto3" json:"last_decision_signatures,omitempty"`
 	InFlightProposal       *Proposal              `protobuf:"bytes,4,opt,name=in_flight_proposal,json=inFlightProposal,proto3" json:"in_flight_proposal,omitempty"`
 	InFlightPrepared       bool                   `protobuf:"varint,5,opt,name=in_flight_prepared,json=inFlightPrepared,proto3" json:"in_flight_prepared,omitempty"`
-	unknownFields          protoimpl.UnknownFields
-	sizeCache              protoimpl.SizeCache
+	// in_flight lists every proposal in flight, lowest sequence first and contiguous from the sequence after
+	// last_decision, when the node runs with a pipeline depth above one; in_flight_proposal/in_flight_prepared
+	// then repeat its first entry. A node without a pipeline leaves it empty, so its view data is unchanged.
+	InFlight      []*InFlightEntry `protobuf:"bytes,6,rep,name=in_flight,json=inFlight,proto3" json:"in_flight,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *ViewData) Reset() {
 	*x = ViewData{}
-	mi := &file_smartbftprotos_messages_proto_msgTypes[7]
+	mi := &file_smartbftprotos_messages_proto_msgTypes[8]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -621,7 +678,7 @@ func (x *ViewData) String() string {
 func (*ViewData) ProtoMessage() {}
 
 func (x *ViewData) ProtoReflect() protoreflect.Message {
-	mi := &file_smartbftprotos_messages_proto_msgTypes[7]
+	mi := &file_smartbftprotos_messages_proto_msgTypes[8]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -634,7 +691,7 @@ func (x *ViewData) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ViewData.ProtoReflect.Descriptor instead.
 func (*ViewData) Descriptor() ([]byte, []int) {
-	return file_smartbftprotos_messages_proto_rawDescGZIP(), []int{7}
+	return file_smartbftprotos_messages_proto_rawDescGZIP(), []int{8}
 }
 
 func (x *ViewData) GetNextView() uint64 {
@@ -672,6 +729,13 @@ func (x *ViewData) GetInFlightPrepared() bool {
 	return false
 }
 
+func (x *ViewData) GetInFlight() []*InFlightEntry {
+	if x != nil {
+		return x.InFlight
+	}
+	return nil
+}
+
 type SignedViewData struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	RawViewData   []byte                 `protobuf:"bytes,1,opt,name=raw_view_data,json=rawViewData,proto3" json:"raw_view_data,omitempty"`
@@ -683,7 +747,7 @@ type SignedViewData struct {
 
 func (x *SignedViewData) Reset() {
 	*x = SignedViewData{}
-	mi := &file_smartbftprotos_messages_proto_msgTypes[8]
+	mi := &file_smartbftprotos_messages_proto_msgTypes[9]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -695,7 +759,7 @@ func (x *SignedViewData) String() string {
 func (*SignedViewData) ProtoMessage() {}
 
 func (x *SignedViewData) ProtoReflect() protoreflect.Message {
-	mi := &file_smartbftprotos_messages_proto_msgTypes[8]
+	mi := &file_smartbftprotos_messages_proto_msgTypes[9]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -708,7 +772,7 @@ func (x *SignedViewData) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SignedViewData.ProtoReflect.Descriptor instead.
 func (*SignedViewData) Descriptor() ([]byte, []int) {
-	return file_smartbftprotos_messages_proto_rawDescGZIP(), []int{8}
+	return file_smartbftprotos_messages_proto_rawDescGZIP(), []int{9}
 }
 
 func (x *SignedViewData) GetRawViewData() []byte {
@@ -741,7 +805,7 @@ type NewView struct {
 
 func (x *NewView) Reset() {
 	*x = NewView{}
-	mi := &file_smartbftprotos_messages_proto_msgTypes[9]
+	mi := &file_smartbftprotos_messages_proto_msgTypes[10]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -753,7 +817,7 @@ func (x *NewView) String() string {
 func (*NewView) ProtoMessage() {}
 
 func (x *NewView) ProtoReflect() protoreflect.Message {
-	mi := &file_smartbftprotos_messages_proto_msgTypes[9]
+	mi := &file_smartbftprotos_messages_proto_msgTypes[10]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -766,7 +830,7 @@ func (x *NewView) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NewView.ProtoReflect.Descriptor instead.
 func (*NewView) Descriptor() ([]byte, []int) {
-	return file_smartbftprotos_messages_proto_rawDescGZIP(), []int{9}
+	return file_smartbftprotos_messages_proto_rawDescGZIP(), []int{10}
 }
 
 func (x *NewView) GetSignedViewData() []*SignedViewData {
@@ -786,7 +850,7 @@ type HeartBeat struct {
 
 func (x *HeartBeat) Reset() {
 	*x = HeartBeat{}
-	mi := &file_smartbftprotos_messages_proto_msgTypes[10]
+	mi := &file_smartbftprotos_messages_proto_msgTypes[11]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -798,7 +862,7 @@ func (x *HeartBeat) String() string {
 func (*HeartBeat) ProtoMessage() {}
 
 func (x *HeartBeat) ProtoReflect() protoreflect.Message {
-	mi := &file_smartbftprotos_messages_proto_msgTypes[10]
+	mi := &file_smartbftprotos_messages_proto_msgTypes[11]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -811,7 +875,7 @@ func (x *HeartBeat) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use HeartBeat.ProtoReflect.Descriptor instead.
 func (*HeartBeat) Descriptor() ([]byte, []int) {
-	return file_smartbftprotos_messages_proto_rawDescGZIP(), []int{10}
+	return file_smartbftprotos_messages_proto_rawDescGZIP(), []int{11}
 }
 
 func (x *HeartBeat) GetView() uint64 {
@@ -837,7 +901,7 @@ type HeartBeatResponse struct {
 
 func (x *HeartBeatResponse) Reset() {
 	*x = HeartBeatResponse{}
-	mi := &file_smartbftprotos_messages_proto_msgTypes[11]
+	mi := &file_smartbftprotos_messages_proto_msgTypes[12]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -849,7 +913,7 @@ func (x *HeartBeatResponse) String() string {
 func (*HeartBeatResponse) ProtoMessage() {}
 
 func (x *HeartBeatResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_smartbftprotos_messages_proto_msgTypes[11]
+	mi := &file_smartbftprotos_messages_proto_msgTypes[12]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -862,7 +926,7 @@ func (x *HeartBeatResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use HeartBeatResponse.ProtoReflect.Descriptor instead.
 func (*HeartBeatResponse) Descriptor() ([]byte, []int) {
-	return file_smartbftprotos_messages_proto_rawDescGZIP(), []int{11}
+	return file_smartbftprotos_messages_proto_rawDescGZIP(), []int{12}
 }
 
 func (x *HeartBeatResponse) GetView() uint64 {
@@ -883,7 +947,7 @@ type Signature struct {
 
 func (x *Signature) Reset() {
 	*x = Signature{}
-	mi := &file_smartbftprotos_messages_proto_msgTypes[12]
+	mi := &file_smartbftprotos_messages_proto_msgTypes[13]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -895,7 +959,7 @@ func (x *Signature) String() string {
 func (*Signature) ProtoMessage() {}
 
 func (x *Signature) ProtoReflect() protoreflect.Message {
-	mi := &file_smartbftprotos_messages_proto_msgTypes[12]
+	mi := &file_smartbftprotos_messages_proto_msgTypes[13]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -908,7 +972,7 @@ func (x *Signature) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Signature.ProtoReflect.Descriptor instead.
 func (*Signature) Descriptor() ([]byte, []int) {
-	return file_smartbftprotos_messages_proto_rawDescGZIP(), []int{12}
+	return file_smartbftprotos_messages_proto_rawDescGZIP(), []int{13}
 }
 
 func (x *Signature) GetSigner() uint64 {
@@ -944,7 +1008,7 @@ type Proposal struct {
 
 func (x *Proposal) Reset() {
 	*x = Proposal{}
-	mi := &file_smartbftprotos_messages_proto_msgTypes[13]
+	mi := &file_smartbftprotos_messages_proto_msgTypes[14]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -956,7 +1020,7 @@ func (x *Proposal) String() string {
 func (*Proposal) ProtoMessage() {}
 
 func (x *Proposal) ProtoReflect() protoreflect.Message {
-	mi := &file_smartbftprotos_messages_proto_msgTypes[13]
+	mi := &file_smartbftprotos_messages_proto_msgTypes[14]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -969,7 +1033,7 @@ func (x *Proposal) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Proposal.ProtoReflect.Descriptor instead.
 func (*Proposal) Descriptor() ([]byte, []int) {
-	return file_smartbftprotos_messages_proto_rawDescGZIP(), []int{13}
+	return file_smartbftprotos_messages_proto_rawDescGZIP(), []int{14}
 }
 
 func (x *Proposal) GetHeader() []byte {
@@ -1013,7 +1077,7 @@ type ViewMetadata struct {
 
 func (x *ViewMetadata) Reset() {
 	*x = ViewMetadata{}
-	mi := &file_smartbftprotos_messages_proto_msgTypes[14]
+	mi := &file_smartbftprotos_messages_proto_msgTypes[15]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1025,7 +1089,7 @@ func (x *ViewMetadata) String() string {
 func (*ViewMetadata) ProtoMessage() {}
 
 func (x *ViewMetadata) ProtoReflect() protoreflect.Message {
-	mi := &file_smartbftprotos_messages_proto_msgTypes[14]
+	mi := &file_smartbftprotos_messages_proto_msgTypes[15]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1038,7 +1102,7 @@ func (x *ViewMetadata) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ViewMetadata.ProtoReflect.Descriptor instead.
 func (*ViewMetadata) Descriptor() ([]byte, []int) {
-	return file_smartbftprotos_messages_proto_rawDescGZIP(), []int{14}
+	return file_smartbftprotos_messages_proto_rawDescGZIP(), []int{15}
 }
 
 func (x *ViewMetadata) GetViewId() uint64 {
@@ -1091,7 +1155,7 @@ type SavedMessage struct {
 
 func (x *SavedMessage) Reset() {
 	*x = SavedMessage{}
-	mi := &file_smartbftprotos_messages_proto_msgTypes[15]
+	mi := &file_smartbftprotos_messages_proto_msgTypes[16]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1103,7 +1167,7 @@ func (x *SavedMessage) String() string {
 func (*SavedMessage) ProtoMessage() {}
 
 func (x *SavedMessage) ProtoReflect() protoreflect.Message {
-	mi := &file_smartbftprotos_messages_proto_msgTypes[15]
+	mi := &file_smartbftprotos_messages_proto_msgTypes[16]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1116,7 +1180,7 @@ func (x *SavedMessage) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SavedMessage.ProtoReflect.Descriptor instead.
 func (*SavedMessage) Descriptor() ([]byte, []int) {
-	return file_smartbftprotos_messages_proto_rawDescGZIP(), []int{15}
+	return file_smartbftprotos_messages_proto_rawDescGZIP(), []int{16}
 }
 
 func (x *SavedMessage) GetContent() isSavedMessage_Content {
@@ -1198,7 +1262,7 @@ type StateTransferRequest struct {
 
 func (x *StateTransferRequest) Reset() {
 	*x = StateTransferRequest{}
-	mi := &file_smartbftprotos_messages_proto_msgTypes[16]
+	mi := &file_smartbftprotos_messages_proto_msgTypes[17]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1210,7 +1274,7 @@ func (x *StateTransferRequest) String() string {
 func (*StateTransferRequest) ProtoMessage() {}
 
 func (x *StateTransferRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_smartbftprotos_messages_proto_msgTypes[16]
+	mi := &file_smartbftprotos_messages_proto_msgTypes[17]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1223,7 +1287,7 @@ func (x *StateTransferRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StateTransferRequest.ProtoReflect.Descriptor instead.
 func (*StateTransferRequest) Descriptor() ([]byte, []int) {
-	return file_smartbftprotos_messages_proto_rawDescGZIP(), []int{16}
+	return file_smartbftprotos_messages_proto_rawDescGZIP(), []int{17}
 }
 
 type StateTransferResponse struct {
@@ -1236,7 +1300,7 @@ type StateTransferResponse struct {
 
 func (x *StateTransferResponse) Reset() {
 	*x = StateTransferResponse{}
-	mi := &file_smartbftprotos_messages_proto_msgTypes[17]
+	mi := &file_smartbftprotos_messages_proto_msgTypes[18]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1248,7 +1312,7 @@ func (x *StateTransferResponse) String() string {
 func (*StateTransferResponse) ProtoMessage() {}
 
 func (x *StateTransferResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_smartbftprotos_messages_proto_msgTypes[17]
+	mi := &file_smartbftprotos_messages_proto_msgTypes[18]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1261,7 +1325,7 @@ func (x *StateTransferResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StateTransferResponse.ProtoReflect.Descriptor instead.
 func (*StateTransferResponse) Descriptor() ([]byte, []int) {
-	return file_smartbftprotos_messages_proto_rawDescGZIP(), []int{17}
+	return file_smartbftprotos_messages_proto_rawDescGZIP(), []int{18}
 }
 
 func (x *StateTransferResponse) GetViewNum() uint64 {
@@ -1325,13 +1389,17 @@ const file_smartbftprotos_messages_proto_rawDesc = "" +
 	"\n" +
 	"ViewChange\x12\x1b\n" +
 	"\tnext_view\x18\x01 \x01(\x04R\bnextView\x12\x16\n" +
-	"\x06reason\x18\x02 \x01(\tR\x06reason\"\xb1\x02\n" +
+	"\x06reason\x18\x02 \x01(\tR\x06reason\"a\n" +
+	"\rInFlightEntry\x124\n" +
+	"\bproposal\x18\x01 \x01(\v2\x18.smartbftprotos.ProposalR\bproposal\x12\x1a\n" +
+	"\bprepared\x18\x02 \x01(\bR\bprepared\"\xed\x02\n" +
 	"\bViewData\x12\x1b\n" +
 	"\tnext_view\x18\x01 \x01(\x04R\bnextView\x12=\n" +
 	"\rlast_decision\x18\x02 \x01(\v2\x18.smartbftprotos.ProposalR\flastDecision\x12S\n" +
 	"\x18last_decision_signatures\x18\x03 \x03(\v2\x19.smartbftprotos.SignatureR\x16lastDecisionSignatures\x12F\n" +
 	"\x12in_flight_proposal\x18\x04 \x01(\v2\x18.smartbftprotos.ProposalR\x10inFlightProposal\x12,\n" +
-	"\x12in_flight_prepared\x18\x05 \x01(\bR\x10inFlightPrepared\"j\n" +
+	"\x12in_flight_prepared\x18\x05 \x01(\bR\x10inFlightPrepared\x12:\n" +
+	"\tin_flight\x18\x06 \x03(\v2\x1d.smartbftprotos.InFlightEntryR\binFlight\"j\n" +
 	"\x0eSignedViewData\x12\"\n" +
 	"\rraw_view_data\x18\x01 \x01(\fR\vrawViewData\x12\x16\n" +
 	"\x06signer\x18\x02 \x01(\x04R\x06signer\x12\x1c\n" +
@@ -1383,7 +1451,7 @@ func file_smartbftprotos_messages_proto_rawDescGZIP() []byte {
 	return file_smartbftprotos_messages_proto_rawDescData
 }
 
-var file_smartbftprotos_messages_proto_msgTypes = make([]protoimpl.MessageInfo, 18)
+var file_smartbftprotos_messages_proto_msgTypes = make([]protoimpl.MessageInfo, 19)
 var file_smartbftprotos_messages_proto_goTypes = []any{
 	(*Message)(nil),               // 0: smartbftprotos.Message
 	(*PrePrepare)(nil),            // 1: smartbftprotos.PrePrepare
@@ -1392,47 +1460,50 @@ var file_smartbftprotos_messages_proto_goTypes = []any{
 	(*Commit)(nil),                // 4: smartbftprotos.Commit
 	(*PreparesFrom)(nil),          // 5: smartbftprotos.PreparesFrom
 	(*ViewChange)(nil),            // 6: smartbftprotos.ViewChange
-	(*ViewData)(nil),              // 7: smartbftprotos.ViewData
-	(*SignedViewData)(nil),        // 8: smartbftprotos.SignedViewData
-	(*NewView)(nil),               // 9: smartbftprotos.NewView
-	(*HeartBeat)(nil),             // 10: smartbftprotos.HeartBeat
-	(*HeartBeatResponse)(nil),     // 11: smartbftprotos.HeartBeatResponse
-	(*Signature)(nil),             // 12: smartbftprotos.Signature
-	(*Proposal)(nil),              // 13: smartbftprotos.Proposal
-	(*ViewMetadata)(nil),          // 14: smartbftprotos.ViewMetadata
-	(*SavedMessage)(nil),          // 15: smartbftprotos.SavedMessage
-	(*StateTransferRequest)(nil),  // 16: smartbftprotos.StateTransferRequest
-	(*StateTransferResponse)(nil), // 17: smartbftprotos.StateTransferResponse
+	(*InFlightEntry)(nil),         // 7: smartbftprotos.InFlightEntry
+	(*ViewData)(nil),              // 8: smartbftprotos.ViewData
+	(*SignedViewData)(nil),        // 9: smartbftprotos.SignedViewData
+	(*NewView)(nil),               // 10: smartbftprotos.NewView
+	(*HeartBeat)(nil),             // 11: smartbftprotos.HeartBeat
+	(*HeartBeatResponse)(nil),     // 12: smartbftprotos.HeartBeatResponse
+	(*Signature)(nil),             // 13: smartbftprotos.Signature
+	(*Proposal)(nil),              // 14: smartbftprotos.Proposal
+	(*ViewMetadata)(nil),          // 15: smartbftprotos.ViewMetadata
+	(*SavedMessage)(nil),          // 16: smartbftprotos.SavedMessage
+	(*StateTransferRequest)(nil),  // 17: smartbftprotos.StateTransferRequest
+	(*StateTransferResponse)(nil), // 18: smartbftprotos.StateTransferResponse
 }
 var file_smartbftprotos_messages_proto_depIdxs = []int32{
 	1,  // 0: smartbftprotos.Message.pre_prepare:type_name -> smartbftprotos.PrePrepare
 	2,  // 1: smartbftprotos.Message.prepare:type_name -> smartbftprotos.Prepare
 	4,  // 2: smartbftprotos.Message.commit:type_name -> smartbftprotos.Commit
 	6,  // 3: smartbftprotos.Message.view_change:type_name -> smartbftprotos.ViewChange
-	8,  // 4: smartbftprotos.Message.view_data:type_name -> smartbftprotos.SignedViewData
-	9,  // 5: smartbftprotos.Message.new_view:type_name -> smartbftprotos.NewView
-	10, // 6: smartbftprotos.Message.heart_beat:type_name -> smartbftprotos.HeartBeat
-	11, // 7: smartbftprotos.Message.heart_beat_response:type_name -> smartbftprotos.HeartBeatResponse
-	16, // 8: smartbftprotos.Message.state_transfer_request:type_name -> smartbftprotos.StateTransferRequest
-	17, // 9: smartbftprotos.Message.state_transfer_response:type_name -> smartbftprotos.StateTransferResponse
-	13, // 10: smartbftprotos.PrePrepare.proposal:type_name -> smartbftprotos.Proposal
-	12, // 11: smartbftprotos.PrePrepare.prev_commit_signatures:type_name -> smartbftprotos.Signature
+	9,  // 4: smartbftprotos.Message.view_data:type_name -> smartbftprotos.SignedViewData
+	10, // 5: smartbftprotos.Message.new_view:type_name -> smartbftprotos.NewView
+	11, // 6: smartbftprotos.Message.heart_beat:type_name -> smartbftprotos.HeartBeat
+	12, // 7: smartbftprotos.Message.heart_beat_response:type_name -> smartbftprotos.HeartBeatResponse
+	17, // 8: smartbftprotos.Message.state_transfer_request:type_name -> smartbftprotos.StateTransferRequest
+	18, // 9: smartbftprotos.Message.state_transfer_response:type_name -> smartbftprotos.StateTransferResponse
+	14, // 10: smartbftprotos.PrePrepare.proposal:type_name -> smartbftprotos.Proposal
+	13, // 11: smartbftprotos.PrePrepare.prev_commit_signatures:type_name -> smartbftprotos.Signature
 	1,  // 12: smartbftprotos.ProposedRecord.pre_prepare:type_name -> smartbftprotos.PrePrepare
 	2,  // 13: smartbftprotos.ProposedRecord.prepare:type_name -> smartbftprotos.Prepare
-	12, // 14: smartbftprotos.Commit.signature:type_name -> smartbftprotos.Signature
-	13, // 15: smartbftprotos.ViewData.last_decision:type_name -> smartbftprotos.Proposal
-	12, // 16: smartbftprotos.ViewData.last_decision_signatures:type_name -> smartbftprotos.Signature
-	13, // 17: smartbftprotos.ViewData.in_flight_proposal:type_name -> smartbftprotos.Proposal
-	8,  // 18: smartbftprotos.NewView.signed_view_data:type_name -> smartbftprotos.SignedViewData
-	3,  // 19: smartbftprotos.SavedMessage.proposed_record:type_name -> smartbftprotos.ProposedRecord
-	0,  // 20: smartbftprotos.SavedMessage.commit:type_name -> smartbftprotos.Message
-	14, // 21: smartbftprotos.SavedMessage.new_view:type_name -> smartbftprotos.ViewMetadata
-	6,  // 22: smartbftprotos.SavedMessage.view_change:type_name -> smartbftprotos.ViewChange
-	23, // [23:23] is the sub-list for method output_type
-	23, // [23:23] is the sub-list for method input_type
-	23, // [23:23] is the sub-list for extension type_name
-	23, // [23:23] is the sub-list for extension extendee
-	0,  // [0:23] is the sub-list for field type_name
+	13, // 14: smartbftprotos.Commit.signature:type_name -> smartbftprotos.Signature
+	14, // 15: smartbftprotos.InFlightEntry.proposal:type_name -> smartbftprotos.Proposal
+	14, // 16: smartbftprotos.ViewData.last_decision:type_name -> smartbftprotos.Proposal
+	13, // 17: smartbftprotos.ViewData.last_decision_signatures:type_name -> smartbftprotos.Signature
+	14, // 18: smartbftprotos.ViewData.in_flight_proposal:type_name -> smartbftprotos.Proposal
+	7,  // 19: smartbftprotos.ViewData.in_flight:type_name -> smartbftprotos.InFlightEntry
+	9,  // 20: smartbftprotos.NewView.signed_view_data:type_name -> smartbftprotos.SignedViewData
+	3,  // 21: smartbftprotos.SavedMessage.proposed_record:type_name -> smartbftprotos.ProposedRecord
+	0,  // 22: smartbftprotos.SavedMessage.commit:type_name -> smartbftprotos.Message
+	15, // 23: smartbftprotos.SavedMessage.new_view:type_name -> smartbftprotos.ViewMetadata
+	6,  // 24: smartbftprotos.SavedMessage.view_change:type_name -> smartbftprotos.ViewChange
+	25, // [25:25] is the sub-list for method output_type
+	25, // [25:25] is the sub-list for method input_type
+	25, // [25:25] is the sub-list for extension type_name
+	25, // [25:25] is the sub-list for extension extendee
+	0,  // [0:25] is the sub-list for field type_name
 }
 
 func init() { file_smartbftprotos_messages_proto_init() }
@@ -1452,7 +1523,7 @@ func file_smartbftprotos_messages_proto_init() {
 		(*Message_StateTransferRequest)(nil),
 		(*Message_StateTransferResponse)(nil),
 	}
-	file_smartbftprotos_messages_proto_msgTypes[15].OneofWrappers = []any{
+	file_smartbftprotos_messages_proto_msgTypes[16].OneofWrappers = []any{
 		(*SavedMessage_ProposedRecord)(nil),
 		(*SavedMessage_Commit)(nil),
 		(*SavedMessage_NewView)(nil),
@@ -1464,7 +1535,7 @@ func file_smartbftprotos_messages_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_smartbftprotos_messages_proto_rawDesc), len(file_smartbftprotos_messages_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   18,
+			NumMessages:   19,
 			NumExtensions: 0,
 			NumServices:   0,
 		},
