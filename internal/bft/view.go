@@ -552,12 +552,15 @@ func (v *View) acceptVerifiedSig(vs verifiedSig) {
 	slot.signatures = append(slot.signatures, vs.sig)
 }
 
-// resendPrePrepares broadcasts again the pre-prepares of the sequences this leader proposed and has not
-// seen a prepare quorum for, so that a follower that missed one fills the gap and prepares what is above it.
-// A sequence that is prepared here was accepted by a quorum, which no longer needs the pre-prepare and, with
-// the prefix rule, holds every pre-prepare below it too; a node outside that quorum catches up through the
-// previous sequence messages or through sync, as it always did. Resending the prepared sequences as well
-// would only reach nodes that have them, and some that have already delivered them.
+// resendPrePrepares broadcasts again the pre-prepares, and the leader's own prepares, of the sequences this
+// leader proposed and has not seen a prepare quorum for, so that a follower that missed them fills the gap and
+// prepares what is above it. The prepare goes with the pre-prepare because the two are lost together: a
+// follower that has not installed the view yet when the leader's first messages arrive drops both, and without
+// the leader's prepare it is one vote short of the quorum when the other followers are few. A sequence that is
+// prepared here was accepted by a quorum, which no longer needs either and, with the prefix rule, holds every
+// pre-prepare below it too; a node outside that quorum catches up through the previous sequence messages or
+// through sync, as it always did. A follower that has the messages ignores the repeats (one pre-prepare per
+// sequence, one vote per sender).
 func (v *View) resendPrePrepares() {
 	v.seqLock.Lock()
 	head := v.head // written by the leader's proposer goroutine
@@ -568,6 +571,9 @@ func (v *View) resendPrePrepares() {
 			continue
 		}
 		v.Comm.BroadcastConsensus(slot.prePrepare)
+		if slot.phase == slotProposed && slot.lastBroadcastSent != nil {
+			v.Comm.BroadcastConsensus(slot.lastBroadcastSent) // the prepare this leader sent for it
+		}
 	}
 }
 
