@@ -601,33 +601,37 @@ func TestViewLeaderResendsPrePrepares(t *testing.T) {
 		second := windowProposal(low+1, windowDecisionsFor(low+1))
 		v.Propose(first)
 		v.Propose(second)
-		var originals []*protos.Message
+		var originals, prepares []*protos.Message
 		for _, seq := range []uint64{low, low + 1} {
 			pp := f.comm.nextBroadcast(t, "a pre-prepare")
 			require.Equal(t, seq, pp.GetPrePrepare().GetSeq())
 			originals = append(originals, pp)
 			prepare := f.comm.nextBroadcast(t, "a prepare")
 			require.Equal(t, seq, prepare.GetPrepare().GetSeq())
+			prepares = append(prepares, prepare)
 		}
 		require.Equal(t, uint64(2), v.inFlightCount())
 
+		// Each open sequence is resent as its pre-prepare followed by the leader's prepare for it.
 		tick <- time.Now()
-		for _, original := range originals {
+		for i, original := range originals {
 			resent := f.comm.nextBroadcast(t, "a resent pre-prepare")
 			require.True(t, proto.Equal(original, resent), "expected %s, got %s", MsgToString(original), MsgToString(resent))
+			resentPrepare := f.comm.nextBroadcast(t, "the resent prepare")
+			require.True(t, proto.Equal(prepares[i], resentPrepare), "expected %s, got %s", MsgToString(prepares[i]), MsgToString(resentPrepare))
 		}
 
 		// The first sequence is committed and delivered: only the second one is resent.
 		f.prepareAndCommit(t, low, first.Digest(), 2, 3)
 		f.decider.next(t, "the first decision")
-		tick <- time.Now()
-		resent := f.comm.nextBroadcast(t, "the resent second pre-prepare")
-		require.True(t, proto.Equal(originals[1], resent))
-		tick <- time.Now()
-		resent = f.comm.nextBroadcast(t, "the resent second pre-prepare, again")
-		require.True(t, proto.Equal(originals[1], resent))
-		// 2 pre-prepares + 2 prepares, 2 resent, the commit of the first, the second resent twice.
-		require.Equal(t, 9, f.comm.broadcastCount())
+		for range 2 {
+			tick <- time.Now()
+			resent := f.comm.nextBroadcast(t, "the resent second pre-prepare")
+			require.True(t, proto.Equal(originals[1], resent))
+			require.True(t, proto.Equal(prepares[1], f.comm.nextBroadcast(t, "the resent second prepare")))
+		}
+		// 2 pre-prepares + 2 prepares, 4 resent, the commit of the first, the second resent twice (2 each).
+		require.Equal(t, 13, f.comm.broadcastCount())
 	})
 
 	t.Run("depth 2 does not resend prepared sequences", func(t *testing.T) {
@@ -644,26 +648,26 @@ func TestViewLeaderResendsPrePrepares(t *testing.T) {
 		second := windowProposal(low+1, windowDecisionsFor(low+1))
 		v.Propose(first)
 		v.Propose(second)
-		var originals []*protos.Message
+		var originals, prepares []*protos.Message
 		for range []uint64{low, low + 1} {
 			originals = append(originals, f.comm.nextBroadcast(t, "a pre-prepare"))
-			f.comm.nextBroadcast(t, "a prepare")
+			prepares = append(prepares, f.comm.nextBroadcast(t, "a prepare"))
 		}
 
 		// A prepare quorum for the first sequence: the leader commits it, and it is not resent any more,
-		// since every node of the quorum holds its pre-prepare; the second, still open, is.
+		// since every node of the quorum holds its pre-prepare; the second, still open, is, with its prepare.
 		v.HandleMessage(2, prepareMsg(low, first.Digest(), false))
 		v.HandleMessage(3, prepareMsg(low, first.Digest(), false))
 		commit := f.comm.nextBroadcast(t, "the commit of the first sequence")
 		require.NotNil(t, commit.GetCommit())
-		tick <- time.Now()
-		resent := f.comm.nextBroadcast(t, "the resent second pre-prepare")
-		require.True(t, proto.Equal(originals[1], resent), "expected %s, got %s", MsgToString(originals[1]), MsgToString(resent))
-		tick <- time.Now()
-		resent = f.comm.nextBroadcast(t, "the resent second pre-prepare, again")
-		require.True(t, proto.Equal(originals[1], resent))
-		// 2 pre-prepares + 2 prepares, the commit of the first, the second resent twice.
-		require.Equal(t, 7, f.comm.broadcastCount())
+		for range 2 {
+			tick <- time.Now()
+			resent := f.comm.nextBroadcast(t, "the resent second pre-prepare")
+			require.True(t, proto.Equal(originals[1], resent), "expected %s, got %s", MsgToString(originals[1]), MsgToString(resent))
+			require.True(t, proto.Equal(prepares[1], f.comm.nextBroadcast(t, "the resent second prepare")))
+		}
+		// 2 pre-prepares + 2 prepares, the commit of the first, the second resent twice (pre-prepare + prepare).
+		require.Equal(t, 9, f.comm.broadcastCount())
 	})
 
 	t.Run("depth 2 creates a ticker from the interval", func(t *testing.T) {
@@ -903,13 +907,14 @@ func TestViewStartsFromRestoredSlots(t *testing.T) {
 	require.NotNil(t, prepare.GetPrepare())
 	require.Equal(t, low+1, prepare.GetPrepare().GetSeq())
 
-	// Only the sequence without a prepare quorum is resent.
+	// Only the sequence without a prepare quorum is resent: its pre-prepare and the leader's prepare for it.
 	tick <- time.Now()
 	resent := f.comm.nextBroadcast(t, "the resent pre-prepare")
 	require.NotNil(t, resent.GetPrePrepare())
 	require.Equal(t, low+1, resent.GetPrePrepare().GetSeq())
 	require.True(t, proto.Equal(prePrepareMsg(low+1, second), resent))
-	require.Equal(t, 3, f.comm.broadcastCount())
+	require.True(t, proto.Equal(prepare, f.comm.nextBroadcast(t, "the resent prepare")))
+	require.Equal(t, 4, f.comm.broadcastCount())
 
 	// The restored sequences complete as the view's own would, in order.
 	f.prepareAndCommit(t, low+1, second.Digest(), 3, 4)

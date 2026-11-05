@@ -169,6 +169,34 @@ func TestMultiInFlightThenViewChange(t *testing.T) {
 	requireIdenticalInOrder(t, c.collectFrom([]int{1, 2, 3, 4}, 2, 60*time.Second), 4)
 }
 
+// TestMultiInFlightThenLeaderDisconnect covers the view start race with the leader gone (fix/view-start-race):
+// three nodes remain, the new leader's first pre-prepare and prepare may reach a follower before it installed
+// the new view and be dropped there, and with the prepare lost the two other nodes alone are one vote short.
+// The leader resends both at its resend period, so the new view's first sequence completes without another
+// view change; the followers that complain about the old leader drive the change.
+func TestMultiInFlightThenLeaderDisconnect(t *testing.T) {
+	c := newViewChangeCluster(t, nil, nil)
+	defer c.shutdown()
+
+	release := c.prepareWithoutCommits(t, 1, []int{2, 3, 4}, 3)
+	c.nodes[0].Disconnect()
+	release()
+	c.nextID++
+	for _, n := range []int{2, 3, 4} { // the same request on every follower: they forward it, time out and complain
+		c.nodes[n-1].Submit(Request{ID: strconv.Itoa(c.nextID), ClientID: "alice"})
+	}
+	for _, n := range []uint64{2, 3, 4} {
+		c.logs.waitFor(t, n, "Starting view with number 1, sequence 4")
+	}
+	// The three recovered proposals and the request that triggered the change, with no further view change.
+	requireIdenticalInOrder(t, c.collectFrom([]int{2, 3, 4}, 4, 60*time.Second), 1)
+	c.submitTo(2, 2)
+	requireIdenticalInOrder(t, c.collectFrom([]int{2, 3, 4}, 2, 60*time.Second), 5)
+	for _, n := range []uint64{2, 3, 4} {
+		require.Zero(t, c.logs.count(n, "Starting view with number 2"), "node %d went through a second view change", n)
+	}
+}
+
 // TestRepeatedLeaderChangesKeepDecisions covers S1 experimentally: two leader changes in a row, each with three
 // prepared proposals in flight. What the first new view decided stays decided through the second; every node ends
 // with the same records in order.
