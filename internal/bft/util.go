@@ -7,11 +7,13 @@ package bft
 
 import (
 	"bytes"
+	"cmp"
 	"crypto/sha256"
 	"encoding/asn1"
 	"encoding/base64"
 	"fmt"
 	"math"
+	"slices"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -279,7 +281,9 @@ func (ifp *InFlightData) StoreProposalAt(seq uint64, prop types.Proposal) {
 // StorePrepares stores alongside the already stored in-flight proposal of the given sequence that it is prepared.
 // When no proposal is stored under that sequence but exactly one proposal is in flight, that one is marked, as
 // it was when a single proposal was tracked (a proposal stored without metadata is under sequence 0).
-func (ifp *InFlightData) StorePrepares(view, seq uint64) {
+// The prepared flag is evidence about one proposal: it is refused, and false returned, when the commit it comes
+// from names another view than the proposal's metadata does.
+func (ifp *InFlightData) StorePrepares(view, seq uint64) bool {
 	ifp.lock.Lock()
 	defer ifp.lock.Unlock()
 
@@ -293,7 +297,53 @@ func (ifp *InFlightData) StorePrepares(view, seq uint64) {
 		}
 	}
 
+	if len(entry.proposal.Metadata) > 0 {
+		md := &protos.ViewMetadata{}
+		if proto.Unmarshal(entry.proposal.Metadata, md) == nil && md.GetViewId() != view {
+			return false
+		}
+	}
+
 	ifp.entries[seq] = &inFlightProposalData{proposal: entry.proposal, prepared: true}
+	return true
+}
+
+// inFlightEntry is one proposal in flight, as reported to a view change.
+type inFlightEntry struct {
+	seq      uint64
+	proposal *types.Proposal
+	prepared bool
+}
+
+// inFlightEntries returns every in-flight proposal, lowest sequence first.
+func (ifp *InFlightData) inFlightEntries() []inFlightEntry {
+	ifp.lock.RLock()
+	defer ifp.lock.RUnlock()
+
+	all := make([]inFlightEntry, 0, len(ifp.entries))
+	for seq, entry := range ifp.entries {
+		all = append(all, inFlightEntry{seq: seq, proposal: entry.proposal, prepared: entry.prepared})
+	}
+	slices.SortFunc(all, func(a, b inFlightEntry) int { return cmp.Compare(a.seq, b.seq) })
+	return all
+}
+
+// clearAbove forgets every in-flight proposal with a sequence above the given one: when a view starts at that
+// sequence, the proposals above it belong to the suffix the view change discarded (rule D1), and must not be
+// reported as in flight by the next view change. The entry at the sequence itself stays: it is the proposal the
+// previous view did not get decided, which the next view change reports again, as the sequential view always did.
+func (ifp *InFlightData) clearAbove(seq uint64) {
+	if ifp == nil { // a controller built without in-flight data (tests)
+		return
+	}
+	ifp.lock.Lock()
+	defer ifp.lock.Unlock()
+
+	for s := range ifp.entries {
+		if s > seq {
+			delete(ifp.entries, s)
+		}
+	}
 }
 
 func (ifp *InFlightData) clear() {

@@ -90,7 +90,9 @@ func (ps *PersistedState) storeProposal(proposed *protos.ProposedRecord) {
 
 func (ps *PersistedState) storePrepared(commitMsg *protos.Message) {
 	cmt := commitMsg.GetCommit()
-	ps.InFlightProposal.StorePrepares(cmt.GetView(), cmt.GetSeq())
+	if !ps.InFlightProposal.StorePrepares(cmt.GetView(), cmt.GetSeq()) {
+		ps.Logger.Warnf("The commit of sequence %d names view %d but the proposal in flight under that sequence is of another view; not marking it prepared", cmt.GetSeq(), cmt.GetView())
+	}
 }
 
 func (ps *PersistedState) LoadNewViewIfApplicable() (*types.ViewAndSeq, error) {
@@ -220,7 +222,7 @@ func (ps *PersistedState) Restore(v *View) error {
 		return nil
 	case lastPersistedMessage.GetViewChange() != nil:
 		ps.Logger.Infof("last entry in WAL is a viewChange message")
-		return nil
+		return ps.restoreInFlightBeforeViewChange(v, entries[:len(entries)-1], lastPersistedMessage.GetViewChange())
 	case lastPersistedMessage.GetProposedRecord() == nil && lastPersistedMessage.GetCommit() == nil:
 		return fmt.Errorf("unrecognized record: %v", lastPersistedMessage)
 	}
@@ -237,6 +239,7 @@ func (ps *PersistedState) Restore(v *View) error {
 	if err != nil {
 		return err
 	}
+	restored = ps.validateRestored(restored, v)
 	if len(restored) == 0 {
 		ps.Logger.Infof("Every proposal in the WAL was delivered already, nothing in flight to restore")
 		return nil
@@ -260,6 +263,79 @@ func (ps *PersistedState) Restore(v *View) error {
 	v.DecisionsInView = lowest.decisionsInView
 	ps.Logger.Infof("Restored %d proposals in flight, sequences %d to %d", len(restored), lowest.seq, restored[len(restored)-1].seq)
 	return nil
+}
+
+// restoreInFlightBeforeViewChange handles a WAL that ends with a view-change record: the node was taking part
+// in a view change when it stopped, and the proposals it had in flight in the view it was leaving are still the
+// evidence it owes the view change (a prepared proposal of this node may be one of the f+1 that protect a value
+// some node committed, rule S2). They are restored into the in-flight data only, so that the view data this node
+// sends again reports them; the view itself is not restored, the view-change record defines where the node is.
+// The view-change record names the view being left in next_view (it is written before the view changer moves
+// on), so the proposals kept are those of that view, after the previous view record if any.
+func (ps *PersistedState) restoreInFlightBeforeViewChange(v *View, entries [][]byte, viewChange *protos.ViewChange) error {
+	records, boundary, err := ps.unmarshalAfterBoundary(entries)
+	if err != nil {
+		return err
+	}
+	slots, err := foldSlots(records)
+	if err != nil {
+		return err
+	}
+	leaving := boundaryView{found: true, view: viewChange.GetNextView()}
+	if boundary.found && boundary.view != leaving.view {
+		// A view record of another view sits between: whatever follows it must be of the view being left.
+		ps.Logger.Warnf("The view-change record leaves view %d but the previous view record is of view %d", leaving.view, boundary.view)
+	}
+	restored, err := ps.filterInFlight(slots, leaving, v)
+	if err != nil {
+		return err
+	}
+	restored = ps.validateRestored(restored, v)
+	if len(restored) == 0 {
+		ps.Logger.Infof("Nothing in flight before the viewChange record")
+		return nil
+	}
+	for _, r := range restored {
+		ps.storeProposal(r.proposed)
+		if r.commit != nil {
+			ps.storePrepared(r.commit)
+		}
+	}
+	ps.Logger.Infof("Restored %d proposals in flight of view %d into the in-flight data, sequences %d to %d, for the view change in progress",
+		len(restored), leaving.view, restored[0].seq, restored[len(restored)-1].seq)
+	return nil
+}
+
+// validateRestored checks that every restored record is evidence about the proposal it is filed under: the
+// proposal's metadata names the record's view and sequence, and the commit, when there is one, is this node's
+// commit of that very proposal (same view and sequence, the proposal's digest). A proposal whose metadata does
+// not match ends the restore there (it and what follows are dropped); a commit that does not match is dropped,
+// leaving the proposal in phase PROPOSED. Both are logged: the WAL is this node's own, so they signal damage.
+func (ps *PersistedState) validateRestored(restored []*restoredSlot, v *View) []*restoredSlot {
+	for i, r := range restored {
+		md := &protos.ViewMetadata{}
+		if err := proto.Unmarshal(r.proposal.Metadata, md); err != nil || md.GetViewId() != r.view || md.GetLatestSequence() != r.seq {
+			ps.Logger.Warnf("Dropping the proposal with sequence %d and what follows from the restore: its metadata names view %d sequence %d, the record view %d",
+				r.seq, md.GetViewId(), md.GetLatestSequence(), r.view)
+			return restored[:i]
+		}
+		if r.commit == nil {
+			continue
+		}
+		cmt := r.commit.GetCommit()
+		switch {
+		case cmt.GetView() != r.view || cmt.GetSeq() != r.seq:
+			ps.Logger.Warnf("Dropping the commit of sequence %d from the restore: it names view %d sequence %d", r.seq, cmt.GetView(), cmt.GetSeq())
+			r.commit = nil
+		case cmt.GetDigest() != "" && cmt.GetDigest() != r.proposal.Digest():
+			ps.Logger.Warnf("Dropping the commit of sequence %d from the restore: its digest is not the proposal's", r.seq)
+			r.commit = nil
+		case v.SelfID != 0 && cmt.GetSignature().GetSigner() != v.SelfID:
+			ps.Logger.Warnf("Dropping the commit of sequence %d from the restore: it was signed by %d, not by this node %d", r.seq, cmt.GetSignature().GetSigner(), v.SelfID)
+			r.commit = nil
+		}
+	}
+	return restored
 }
 
 // boundaryView is the view of the last new-view or view-change record, when there is one.
@@ -365,12 +441,27 @@ func (ps *PersistedState) filterInFlight(slots []*restoredSlot, boundary boundar
 		view = boundary.view
 	}
 	kept := make([]*restoredSlot, 0, len(inFlight))
+	droppedForView := false
 	for _, slot := range inFlight {
 		if slot.view != view {
 			ps.Logger.Warnf("Dropping the proposal with sequence %d of view %d from the restore: the WAL continues view %d", slot.seq, slot.view, view)
+			droppedForView = true
 			continue
 		}
 		kept = append(kept, slot)
+	}
+	if droppedForView {
+		// What was dropped may have left a gap; the proposals of the view that are still contiguous from the
+		// checkpoint are kept, the rest is dropped too: the node catches up on them by sync.
+		contiguous := kept[:0]
+		for i, slot := range kept {
+			if (known && i == 0 && slot.seq != checkpoint+1) || (i > 0 && slot.seq != kept[i-1].seq+1) {
+				ps.Logger.Warnf("Dropping the proposal with sequence %d and what follows from the restore: it does not continue the delivered sequences", slot.seq)
+				break
+			}
+			contiguous = append(contiguous, slot)
+		}
+		return contiguous, nil
 	}
 	for i := 1; i < len(kept); i++ {
 		if kept[i].seq != kept[i-1].seq+1 {

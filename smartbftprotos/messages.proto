@@ -62,12 +62,22 @@ message ViewChange {
     string reason = 2;
 }
 
+// InFlightEntry is one proposal a node had in flight when the view changed, and whether it had prepared it.
+message InFlightEntry {
+    Proposal proposal = 1;
+    bool prepared = 2;
+}
+
 message ViewData {
     uint64 next_view = 1;
     Proposal last_decision = 2;
     repeated Signature last_decision_signatures = 3;
     Proposal in_flight_proposal = 4;
     bool in_flight_prepared = 5;
+    // in_flight lists every proposal in flight, lowest sequence first and contiguous from the sequence after
+    // last_decision, when the node runs with a pipeline depth above one; in_flight_proposal/in_flight_prepared
+    // then repeat its first entry. A node without a pipeline leaves it empty, so its view data is unchanged.
+    repeated InFlightEntry in_flight = 6;
 }
 
 message SignedViewData {

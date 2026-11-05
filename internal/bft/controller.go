@@ -438,6 +438,11 @@ func (c *Controller) changeView(newViewNumber uint64, newProposalSequence uint64
 
 	c.setCurrentViewNumber(newViewNumber)
 	c.setCurrentDecisionsInView(newDecisionsInView)
+	// D1: the view that starts at newProposalSequence knows nothing above it; whatever the previous view had in
+	// flight there was discarded by the view change (or belongs to the aborted instance) and must not be reported
+	// as in flight again. The argument is the new low watermark: on the sync path it is the synced sequence plus
+	// one, after sync() cleared up to the synced sequence, so what remains is at most the entry at the new low.
+	c.InFlight.clearAbove(newProposalSequence)
 	if iAm, _ := c.iAmTheLeader(); iAm {
 		// Reopen the batcher before the view issues its leader tokens: the proposer takes a token as soon as
 		// it is issued, and discards it when the batcher is still closed from the view change.

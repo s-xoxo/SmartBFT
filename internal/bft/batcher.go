@@ -140,10 +140,14 @@ func (b *BatchBuilder) Close() {
 	close(b.closeChan)
 }
 
-// Closed returns true if the batcher is closed
+// Closed returns true if the batcher is closed. The proposer goroutine asks while the controller may be
+// resetting the batcher for a new view, so the channel is read under the same lock Reset replaces it under.
 func (b *BatchBuilder) Closed() bool {
+	b.closeLock.Lock()
+	closeChan := b.closeChan
+	b.closeLock.Unlock()
 	select {
-	case <-b.closeChan:
+	case <-closeChan:
 		return true
 	default:
 		return false

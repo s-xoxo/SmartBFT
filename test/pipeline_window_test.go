@@ -73,6 +73,18 @@ func (l *windowLogs) count(id uint64, substr string) int {
 	return n
 }
 
+// indexOf returns the position of the first entry of the node containing substr, or -1.
+func (l *windowLogs) indexOf(id uint64, substr string) int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for i, e := range l.entries[id] {
+		if strings.Contains(e, substr) {
+			return i
+		}
+	}
+	return -1
+}
+
 func (l *windowLogs) maxInFlight() int {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -81,7 +93,14 @@ func (l *windowLogs) maxInFlight() int {
 
 func (l *windowLogs) waitFor(t *testing.T, id uint64, substr string) {
 	t.Helper()
-	deadline := time.After(30 * time.Second)
+	l.waitForWithin(t, id, substr, 30*time.Second)
+}
+
+// waitForWithin is waitFor with its own deadline, for events that wait on a heartbeat period or a view-change
+// timeout rather than on message round trips.
+func (l *windowLogs) waitForWithin(t *testing.T, id uint64, substr string, within time.Duration) {
+	t.Helper()
+	deadline := time.After(within)
 	for l.count(id, substr) == 0 {
 		select {
 		case <-l.notify:
@@ -99,6 +118,9 @@ type windowCluster struct {
 	nodes   []*App
 	logs    *windowLogs
 	nextID  int
+	// delivered keeps, per node (1-based), every record the collect helpers took from its Delivered channel.
+	deliveredMu sync.Mutex
+	delivered   map[int][]*AppRecord
 }
 
 func newWindowCluster(t *testing.T, depth uint64, prepare func(n *App)) *windowCluster {
@@ -110,7 +132,7 @@ func newWindowCluster(t *testing.T, depth uint64, prepare func(n *App)) *windowC
 	cfg.DecisionsPerLeader = 0
 	cfg.RequestBatchMaxCount = 1 // one request is one proposal
 
-	c := &windowCluster{t: t, network: NewNetwork(), logs: newWindowLogs()}
+	c := &windowCluster{t: t, network: NewNetwork(), logs: newWindowLogs(), delivered: make(map[int][]*AppRecord)}
 	testDir := t.TempDir()
 	for i := 1; i <= 4; i++ {
 		n := newNodeWithConfig(uint64(i), c.network, t.Name(), testDir, cfg)
@@ -133,6 +155,19 @@ func (c *windowCluster) submit(count int) {
 	}
 }
 
+func (c *windowCluster) remember(node int, r *AppRecord) {
+	c.deliveredMu.Lock()
+	defer c.deliveredMu.Unlock()
+	c.delivered[node] = append(c.delivered[node], r)
+}
+
+// deliveredSoFar returns the records the given node (1-based) delivered so far in this test, in order.
+func (c *windowCluster) deliveredSoFar(node int) []*AppRecord {
+	c.deliveredMu.Lock()
+	defer c.deliveredMu.Unlock()
+	return c.delivered[node]
+}
+
 // collect waits until every node delivered count more records and returns them per node.
 func (c *windowCluster) collect(count int) [][]*AppRecord {
 	c.t.Helper()
@@ -142,6 +177,7 @@ func (c *windowCluster) collect(count int) [][]*AppRecord {
 			select {
 			case r := <-n.Delivered:
 				records[i] = append(records[i], r)
+				c.remember(i+1, r)
 			case <-time.After(60 * time.Second):
 				c.t.Fatalf("node %d delivered %d of %d records", n.ID, len(records[i]), count)
 			}
@@ -357,38 +393,47 @@ func TestPipelineRestartRestoresInFlight(t *testing.T) {
 	requireIdenticalInOrder(t, c.collect(3), 3)
 }
 
-// TestPipelineLeaderRestartWithInFlight covers the restored leader: with the followers' commits held it has
-// two proposals in flight, prepared, when it restarts. It restores both, issues W-2 = 1 token (so it proposes
-// exactly one more sequence before any decision), and once the commits flow every node delivers the four
-// sequences identically.
+// TestPipelineLeaderRestartWithInFlight covers the restored leader: it loses the commits of its first two
+// proposals, so it has both in flight, prepared, when it restarts while the followers delivered them. It restores
+// both, issues W-2 = 1 token (so it proposes exactly one more sequence before it decides anything), completes the
+// two through the followers' answers to its commits, and then every node has the same four records.
 func TestPipelineLeaderRestartWithInFlight(t *testing.T) {
 	t.Parallel()
-	c := newWindowCluster(t, 3, nil)
+	var leaderLosesCommits atomic.Bool
+	leaderLosesCommits.Store(true)
+	c := newWindowCluster(t, 3, func(n *App) {
+		if n.ID == 1 {
+			n.LoseMessages(func(msg *smartbftprotos.Message) bool { return leaderLosesCommits.Load() && msg.GetCommit() != nil })
+		}
+	})
 	defer c.network.Shutdown()
 
-	// The commits are held for the whole scenario, which must stay well below the request complain timeout.
-	release := holdCommits(c.nodes, []uint64{2, 3, 4}, []uint64{1, 2, 3, 4})
 	c.submit(2)
-	// The leader reaches a prepare quorum for both (its commit records are the last it writes).
+	followers := c.collectFrom([]int{2, 3, 4}, 2, 30*time.Second)
+	requireIdenticalInOrder(t, followers, 1)
 	c.logs.waitFor(t, 1, "Processed prepares for proposal with seq 1")
 	c.logs.waitFor(t, 1, "Processed prepares for proposal with seq 2")
-	require.Zero(t, c.logs.count(1, "Deciding on seq"))
+	require.Zero(t, c.logs.count(1, "Deciding on seq"), "the leader must not decide while it loses the commits")
 
 	leader := c.nodes[0]
+	leaderLosesCommits.Store(false)
 	leader.RestartSync(false)
 	c.logs.waitFor(t, 1, "Restored 2 proposals in flight, sequences 1 to 2")
 
-	// One token left: the third request is proposed, the fourth waits for a decision.
+	// One token left: the third request is proposed at once, the fourth only after a decision, which the leader
+	// reaches once the followers answer its commits from their delivered slots.
 	c.submit(2)
 	c.logs.waitFor(t, 1, "Proposing proposal sequence 3 in view 0")
-	time.Sleep(300 * time.Millisecond)
-	require.Zero(t, c.logs.count(1, "Proposing proposal sequence 4"), "the restored leader exceeded its window")
-	require.Zero(t, c.logs.count(1, "Deciding on seq"))
-
-	release()
-	records := c.collect(4)
-	requireIdenticalInOrder(t, records, 1)
 	c.logs.waitFor(t, 1, "Proposing proposal sequence 4 in view 0")
+	decided := c.logs.indexOf(1, "Deciding on seq 1")
+	proposed4 := c.logs.indexOf(1, "Proposing proposal sequence 4 in view 0")
+	require.NotEqual(t, -1, decided)
+	require.Less(t, decided, proposed4, "the fourth proposal must wait for a decision: W-2 tokens after the restore")
+
+	leaderRecords := c.collectFrom([]int{1}, 4, 60*time.Second)
+	rest := c.collectFrom([]int{2, 3, 4}, 2, 60*time.Second)
+	require.Equal(t, followers[0], leaderRecords[0][:2])
+	requireIdenticalInOrder(t, [][]*AppRecord{leaderRecords[0][2:], rest[0], rest[1], rest[2]}, 3)
 }
 
 // TestPipelineRestartAfterDeliveryStartsClean covers the checkpoint filter: a leader that restarts right after

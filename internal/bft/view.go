@@ -559,7 +559,10 @@ func (v *View) acceptVerifiedSig(vs verifiedSig) {
 // previous sequence messages or through sync, as it always did. Resending the prepared sequences as well
 // would only reach nodes that have them, and some that have already delivered them.
 func (v *View) resendPrePrepares() {
-	for seq := v.ProposalSequence; seq < v.head; seq++ {
+	v.seqLock.Lock()
+	head := v.head // written by the leader's proposer goroutine
+	v.seqLock.Unlock()
+	for seq := v.ProposalSequence; seq < head; seq++ {
 		slot := v.slots[seq]
 		if slot == nil || slot.prePrepare == nil || slot.phase >= slotPrepared {
 			continue

@@ -417,3 +417,57 @@ func TestControllerTokensAfterRestore(t *testing.T) {
 		})
 	}
 }
+
+// TestInFlightClearedAfterSyncAndViewChange covers rule D1 on the sync path (design-viewchange-multi-inflight.md
+// §3): sync() clears the in-flight data up to the synced sequence and changeView then clears above the new low
+// watermark it is called with, so what remains is at most the entry at the new low. With a depth of one the single
+// entry is never above the low watermark, so nothing changes.
+func TestInFlightClearedAfterSyncAndViewChange(t *testing.T) {
+	const p = uint64(10)
+	proposalAt := func(seq uint64) types.Proposal {
+		return types.Proposal{Payload: []byte{byte(seq)}, Metadata: MarshalOrPanic(&protos.ViewMetadata{ViewId: 0, LatestSequence: seq})}
+	}
+	syncedTo := func(seq uint64) *protos.ViewMetadata { return &protos.ViewMetadata{ViewId: 0, LatestSequence: seq} }
+	sequences := func(ifp *InFlightData) []uint64 {
+		var seqs []uint64
+		for _, e := range ifp.inFlightEntries() {
+			seqs = append(seqs, e.seq)
+		}
+		return seqs
+	}
+	newController := func(depth uint64, inFlight ...uint64) *Controller {
+		c, _ := newWindowController(2, depth, &fakeProposerBuilder{phase: COMMITTED}) // node 2 follows node 1
+		c.currViewNumber = 0
+		c.startView(p)
+		for _, seq := range inFlight {
+			c.InFlight.StoreProposal(proposalAt(seq))
+			c.InFlight.StorePrepares(0, seq)
+		}
+		return c
+	}
+
+	t.Run("sync caught up with everything in flight: nothing remains", func(t *testing.T) {
+		c := newController(3, p, p+1, p+2)
+		c.maybePruneInFlight(syncedTo(p + 2)) // what sync() does, then it returns the new low p+3
+		c.changeView(0, p+3, 3)
+		require.Empty(t, sequences(c.InFlight))
+	})
+	t.Run("sync caught up with the lowest only: the new low stays, the suffix goes", func(t *testing.T) {
+		c := newController(3, p, p+1, p+2)
+		c.maybePruneInFlight(syncedTo(p))
+		c.changeView(0, p+1, 1)
+		require.Equal(t, []uint64{p + 1}, sequences(c.InFlight), "the entry at the new low is reported again, as before; above it is discarded (D1)")
+	})
+	t.Run("depth one: the single entry is at the low watermark and stays", func(t *testing.T) {
+		c := newController(1, p)
+		c.maybePruneInFlight(syncedTo(p - 1)) // sync brought nothing new
+		c.changeView(0, p, 0)
+		require.Equal(t, []uint64{p}, sequences(c.InFlight))
+	})
+	t.Run("a view change decided a prefix: the suffix goes", func(t *testing.T) {
+		c := newController(3, p, p+1, p+2)
+		c.InFlight.pruneDelivered(p) // the view change committed p
+		c.changeView(1, p+1, 0)
+		require.Equal(t, []uint64{p + 1}, sequences(c.InFlight))
+	})
+}

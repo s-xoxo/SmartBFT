@@ -86,6 +86,9 @@ type ViewChanger struct {
 	Checkpoint *types.Checkpoint
 	InFlight   *InFlightData
 	State      State
+	// PipelineDepth is the number of proposals a view may have in flight, W; 0 is treated as 1. With a depth
+	// above one the view data lists every proposal in flight and the view change recovers a prefix of them.
+	PipelineDepth uint64
 
 	Controller    ViewController
 	RequestsTimer RequestsTimer
@@ -464,6 +467,14 @@ func (v *ViewChanger) processViewChangeMsg(restore bool) {
 	v.Logger.Debugf("Node %d sent view data msg, with next view %d, to the new leader %d", v.SelfID, v.currView, leader)
 }
 
+// depth returns the pipeline depth W in effect: PipelineDepth, with 0 treated as 1.
+func (v *ViewChanger) depth() uint64 {
+	if v.PipelineDepth == 0 {
+		return 1
+	}
+	return v.PipelineDepth
+}
+
 func (v *ViewChanger) prepareViewDataMsg() *protos.Message {
 	lastDecision, lastDecisionSignatures := v.Checkpoint.Get()
 	inFlightProposal, prepared := v.InFlight.InFlightProposalAndPrepared()
@@ -475,6 +486,16 @@ func (v *ViewChanger) prepareViewDataMsg() *protos.Message {
 		InFlightProposal:       inFlight,
 		InFlightPrepared:       prepared,
 	}
+	if v.depth() > 1 {
+		// Every proposal in flight, contiguous from the sequence after the last decision; the single fields
+		// repeat the first entry so that a receiver can check the two against each other.
+		vd.InFlight = v.getInFlightEntries(lastDecision)
+		vd.InFlightProposal, vd.InFlightPrepared = nil, false
+		if entries := vd.GetInFlight(); len(entries) > 0 {
+			vd.InFlightProposal, vd.InFlightPrepared = entries[0].GetProposal(), entries[0].GetPrepared()
+		}
+	}
+	v.Logger.Debugf("Node %d reports %d proposals in flight in its view data for view %d", v.SelfID, len(vd.GetInFlight()), v.currView)
 	vdBytes := MarshalOrPanic(vd)
 	sig := v.Signer.Sign(vdBytes)
 	msg := &protos.Message{
@@ -531,6 +552,41 @@ func (v *ViewChanger) getInFlight(lastDecision *protos.Proposal, inFlight *types
 	return proposal
 }
 
+// getInFlightEntries lists the proposals in flight a pipelined node reports: those above the last decision,
+// contiguous from the sequence after it, at most W of them, lowest first. A proposal at or below the last
+// decision was delivered (the checkpoint moved past it, by delivery or by sync) and is not in flight.
+func (v *ViewChanger) getInFlightEntries(lastDecision *protos.Proposal) []*protos.InFlightEntry {
+	var checkpoint uint64
+	if lastDecision != nil && lastDecision.Metadata != nil {
+		md := &protos.ViewMetadata{}
+		if err := proto.Unmarshal(lastDecision.GetMetadata(), md); err != nil {
+			v.Logger.Panicf("Node %d is unable to unmarshal its own last decision metadata from checkpoint, err: %v", v.SelfID, err)
+		}
+		checkpoint = md.GetLatestSequence()
+	}
+	entries := make([]*protos.InFlightEntry, 0, v.depth())
+	next := checkpoint + 1
+	for _, e := range v.InFlight.inFlightEntries() {
+		if e.seq <= checkpoint {
+			continue
+		}
+		if e.seq != next || uint64(len(entries)) == v.depth() {
+			break
+		}
+		entries = append(entries, &protos.InFlightEntry{
+			Proposal: &protos.Proposal{
+				Header:               e.proposal.Header,
+				Metadata:             e.proposal.Metadata,
+				Payload:              e.proposal.Payload,
+				VerificationSequence: uint64(e.proposal.VerificationSequence),
+			},
+			Prepared: e.prepared,
+		})
+		next++
+	}
+	return entries
+}
+
 func (v *ViewChanger) validateViewDataMsg(svd *protos.SignedViewData, sender uint64) bool {
 	if v.getLeader() != v.SelfID { // check if I am the next leader
 		v.Logger.Warnf("Node %d got %s from %d, but %d is not the next leader of view %d", v.SelfID, signedViewDataToString(svd), sender, v.SelfID, v.currView)
@@ -555,7 +611,7 @@ func (v *ViewChanger) validateViewDataMsg(svd *protos.SignedViewData, sender uin
 
 	v.Logger.Debugf("Node %d got %s from %d, and it passed the last decision check", v.SelfID, signedViewDataToString(svd), sender)
 
-	if err := ValidateInFlight(vd.GetInFlightProposal(), lastDecisionSequence); err != nil {
+	if err := ValidateInFlightEntries(vd, lastDecisionSequence, v.depth()); err != nil {
 		v.Logger.Warnf("Node %d got %v from %d, but the in flight proposal is invalid, reason: %v", v.SelfID, signedViewDataToString(svd), sender, err)
 		return false
 	}
@@ -759,6 +815,46 @@ func ValidateLastDecision(vd *protos.ViewData, quorum int, n uint64, verifier ap
 	return md.GetLatestSequence(), nil
 }
 
+// ValidateInFlightEntries validates what a view data reports as in flight, for a node running with the given
+// pipeline depth. Without a pipeline the single in-flight proposal is validated as it always was, and a view data
+// that carries the pipelined list is refused; with a pipeline the list must be contiguous from the sequence after
+// the last decision, at most depth long, and its first entry must be what the single fields repeat, and a view data
+// that carries a single proposal without the list is refused. Nodes of a cluster must run with the same depth.
+func ValidateInFlightEntries(vd *protos.ViewData, lastSequence uint64, depth uint64) error {
+	entries := vd.GetInFlight()
+	if depth <= 1 {
+		if len(entries) > 0 {
+			return fmt.Errorf("the view data lists %d proposals in flight of a pipelined node, but this node runs without a pipeline", len(entries))
+		}
+		return ValidateInFlight(vd.GetInFlightProposal(), lastSequence)
+	}
+	if len(entries) == 0 {
+		if vd.GetInFlightProposal() != nil {
+			return errors.New("the view data carries a single in flight proposal without the pipelined list: its sender runs without a pipeline")
+		}
+		return nil
+	}
+	if uint64(len(entries)) > depth {
+		return fmt.Errorf("the view data lists %d proposals in flight while the pipeline depth is %d", len(entries), depth)
+	}
+	for i, entry := range entries {
+		if entry.GetProposal() == nil || entry.GetProposal().GetMetadata() == nil {
+			return fmt.Errorf("in flight entry %d has no proposal metadata", i)
+		}
+		md := &protos.ViewMetadata{}
+		if err := proto.Unmarshal(entry.GetProposal().GetMetadata(), md); err != nil {
+			return fmt.Errorf("unable to unmarshal the metadata of in flight entry %d, err: %w", i, err)
+		}
+		if expected := lastSequence + 1 + uint64(i); md.GetLatestSequence() != expected {
+			return fmt.Errorf("in flight entry %d has sequence %d while %d is expected after the last decision sequence %d", i, md.GetLatestSequence(), expected, lastSequence)
+		}
+	}
+	if !proto.Equal(entries[0].GetProposal(), vd.GetInFlightProposal()) || entries[0].GetPrepared() != vd.GetInFlightPrepared() {
+		return errors.New("the first in flight entry differs from the single in flight proposal fields")
+	}
+	return nil
+}
+
 // ValidateInFlight validates the given in-flight proposal
 func ValidateInFlight(inFlightProposal *protos.Proposal, lastSequence uint64) error {
 	if inFlightProposal == nil {
@@ -782,7 +878,7 @@ func (v *ViewChanger) processViewDataMsg() {
 		return // need enough (quorum) data to continue
 	}
 	v.Logger.Debugf("Node %d got a quorum of viewData messages", v.SelfID)
-	ok, _, _, err := CheckInFlight(v.getViewDataMessages(), v.f, v.quorum, v.N, v.Verifier)
+	ok, _, err := CheckInFlightPrefix(v.getViewDataMessages(), v.f, v.quorum, v.depth())
 	if err != nil {
 		v.Logger.Panicf("Node %d checked the in flight and it got an error: %v", v.SelfID, err)
 	}
@@ -841,107 +937,130 @@ type possibleProposal struct {
 	noArgument  int
 }
 
-type proposalAndMetadata struct {
-	proposal *protos.Proposal
-	metadata *protos.ViewMetadata
-}
-
 // CheckInFlight checks if there is an in-flight proposal that needs to be decided on (because a node might decided on it already)
 // messages maps the ID of the node that sent the view data to the view data itself, so that every node is counted at most once.
-func CheckInFlight(messages map[uint64]*protos.ViewData, f int, quorum int, n uint64, verifier api.Verifier) (ok, noInFlight bool, inFlightProposal *protos.Proposal, err error) {
-	expectedSequence := maxLastDecisionSequence(messages) + 1
-	possibleProposals := make([]*possibleProposal, 0)
-	proposalsAndMetadata := make([]*proposalAndMetadata, 0)
-	noInFlightCount := 0
-	for _, vd := range messages {
-		if vd.GetInFlightProposal() == nil { // there is no in flight proposal here
-			noInFlightCount++
-			proposalsAndMetadata = append(proposalsAndMetadata, &proposalAndMetadata{nil, nil})
-			continue
-		}
-
-		if vd.InFlightProposal.Metadata == nil { // should have been validated earlier
-			return false, false, nil, errors.New("node has a view data message where the in flight proposal metadata is nil")
-		}
-
-		inFlightMetadata := &protos.ViewMetadata{}
-		if err = proto.Unmarshal(vd.GetInFlightProposal().GetMetadata(), inFlightMetadata); err != nil { // should have been validated earlier
-			return false, false, nil, fmt.Errorf("node was unable to unmarshal the in flight proposal metadata, error: %w", err)
-		}
-
-		proposalsAndMetadata = append(proposalsAndMetadata, &proposalAndMetadata{vd.GetInFlightProposal(), inFlightMetadata})
-
-		if inFlightMetadata.GetLatestSequence() != expectedSequence { // the in flight proposal sequence is not as expected
-			noInFlightCount++
-			continue
-		}
-
-		// now the in flight proposal is with the expected sequence
-		// find possible proposals
-
-		if !vd.GetInFlightPrepared() { // no prepared so isn't a possible proposal
-			noInFlightCount++
-			continue
-		}
-
-		// this proposal is prepared and so it is possible
-		alreadyExists := false
-		for _, p := range possibleProposals {
-			if proto.Equal(p.proposal, vd.GetInFlightProposal()) {
-				alreadyExists = true
-				break
-			}
-		}
-		if !alreadyExists {
-			// this is not a proposal we have seen before
-			possibleProposals = append(possibleProposals, &possibleProposal{proposal: vd.GetInFlightProposal()})
-		}
+// It is the sequential case of CheckInFlightPrefix: at most one proposal, the one with sequence maxLastDecision+1.
+func CheckInFlight(messages map[uint64]*protos.ViewData, f int, quorum int, _ uint64, _ api.Verifier) (ok, noInFlight bool, inFlightProposal *protos.Proposal, err error) {
+	ok, prefix, err := CheckInFlightPrefix(messages, f, quorum, 1)
+	if err != nil || !ok {
+		return false, false, nil, err
 	}
-
-	// fill out info on all possible proposals
-	for _, prop := range proposalsAndMetadata {
-		for _, possible := range possibleProposals {
-			if prop.proposal == nil {
-				possible.noArgument++
-				continue
-			}
-
-			if prop.metadata.GetLatestSequence() != expectedSequence {
-				possible.noArgument++
-				continue
-			}
-
-			if proto.Equal(prop.proposal, possible.proposal) {
-				possible.noArgument++
-				possible.preprepared++
-			}
-		}
-	}
-
-	// see if there is an in flight proposal that is agreed on
-	agreed := -1
-	for i, possible := range possibleProposals {
-		if possible.preprepared < f+1 { // condition A2 doesn't hold
-			continue
-		}
-		if possible.noArgument < quorum { // condition A1 doesn't hold
-			continue
-		}
-		agreed = i
-		break
-	}
-
-	// condition A holds
-	if agreed != -1 {
-		return true, false, possibleProposals[agreed].proposal, nil
-	}
-
-	// condition B holds
-	if noInFlightCount >= quorum { // there is a quorum of messages that support that there is no prepared in flight proposal
+	if len(prefix) == 0 {
 		return true, true, nil, nil
 	}
+	return true, false, prefix[0], nil
+}
 
-	return false, false, nil, nil
+// inFlightEntryAt returns what a view data reports for the given sequence: the proposal and whether it was
+// prepared, or present == false when it reports nothing for that sequence. A pipelined view data is read from
+// its list, a sequential one from its single fields; a proposal of another sequence counts as nothing, as it
+// always did.
+func inFlightEntryAt(vd *protos.ViewData, seq uint64) (proposal *protos.Proposal, prepared, present bool, err error) {
+	candidates := vd.GetInFlight()
+	if len(candidates) == 0 && vd.GetInFlightProposal() != nil {
+		candidates = []*protos.InFlightEntry{{Proposal: vd.GetInFlightProposal(), Prepared: vd.GetInFlightPrepared()}}
+	}
+	for _, entry := range candidates {
+		if entry.GetProposal().GetMetadata() == nil { // should have been validated earlier
+			return nil, false, false, errors.New("node has a view data message where the in flight proposal metadata is nil")
+		}
+		md := &protos.ViewMetadata{}
+		if err := proto.Unmarshal(entry.GetProposal().GetMetadata(), md); err != nil { // should have been validated earlier
+			return nil, false, false, fmt.Errorf("node was unable to unmarshal the in flight proposal metadata, error: %w", err)
+		}
+		if md.GetLatestSequence() == seq {
+			return entry.GetProposal(), entry.GetPrepared(), true, nil
+		}
+	}
+	return nil, false, false, nil
+}
+
+// CheckInFlightPrefix decides, from a quorum of view data messages, which proposals the new view starts by
+// committing: for every sequence after the highest last decision reported, in order, it applies the conditions
+// the single in-flight check always applied to that one sequence.
+//
+//   - A: some prepared proposal p of that sequence is reported by at least f+1 nodes (A2) and no other proposal
+//     of that sequence by more than N-quorum nodes (A1: at least quorum report p or nothing). Then p is kept:
+//     a node that delivered it would have left at least f+1 honest nodes reporting it prepared, so A2 is
+//     necessary for a delivered value (S1), and A2 keeps f byzantine nodes from forcing a value (liveness).
+//   - B: at least quorum nodes report nothing prepared for that sequence. Then nothing was committed there:
+//     had f+1 honest nodes prepared a value, at most 2f could report nothing (S2). The prefix ends here and the
+//     sequences above it are discarded (D1): with delivery in order, nothing above an uncommitted sequence was
+//     delivered either.
+//   - neither: the view data does not decide the sequence; ok is false and the view change is retried (S3).
+//
+// The prefix is contiguous from maxLastDecision+1 and at most depth long. With depth 1 this is the single check.
+func CheckInFlightPrefix(messages map[uint64]*protos.ViewData, f int, quorum int, depth uint64) (ok bool, prefix []*protos.Proposal, err error) {
+	if depth == 0 {
+		depth = 1
+	}
+	base := maxLastDecisionSequence(messages)
+	for seq := base + 1; seq <= base+depth; seq++ {
+		type reported struct {
+			proposal *protos.Proposal
+			prepared bool
+			present  bool
+		}
+		reports := make([]reported, 0, len(messages))
+		possibleProposals := make([]*possibleProposal, 0)
+		noInFlightCount := 0
+		for _, vd := range messages {
+			proposal, prepared, present, err := inFlightEntryAt(vd, seq)
+			if err != nil {
+				return false, nil, err
+			}
+			reports = append(reports, reported{proposal, prepared, present})
+			if !present || !prepared { // nothing here, or not prepared, so no possible proposal
+				noInFlightCount++
+				continue
+			}
+			alreadyExists := false
+			for _, p := range possibleProposals {
+				if proto.Equal(p.proposal, proposal) {
+					alreadyExists = true
+					break
+				}
+			}
+			if !alreadyExists {
+				possibleProposals = append(possibleProposals, &possibleProposal{proposal: proposal})
+			}
+		}
+
+		for _, r := range reports {
+			for _, possible := range possibleProposals {
+				if !r.present {
+					possible.noArgument++
+					continue
+				}
+				if proto.Equal(r.proposal, possible.proposal) {
+					possible.noArgument++
+					possible.preprepared++
+				}
+			}
+		}
+
+		var agreed *possibleProposal
+		for _, possible := range possibleProposals {
+			if possible.preprepared < f+1 { // condition A2 doesn't hold
+				continue
+			}
+			if possible.noArgument < quorum { // condition A1 doesn't hold
+				continue
+			}
+			agreed = possible
+			break
+		}
+		if agreed != nil { // condition A holds: the sequence is kept with this proposal
+			prefix = append(prefix, agreed.proposal)
+			continue
+		}
+		if noInFlightCount >= quorum { // condition B holds: nothing was committed here nor above
+			return true, prefix, nil
+		}
+		return false, nil, nil
+	}
+	// Every sequence a node may have had in flight is in the prefix.
+	return true, prefix, nil
 }
 
 // returns the highest sequence of a last decision within the given view data messages
@@ -1030,7 +1149,7 @@ func (v *ViewChanger) validateNewViewMsg(msg *protos.NewView) (valid bool, sync 
 				v.Logger.Warnf("Node %d is processing newView message, but signature of %s is invalid, ignoring it, error: %v", v.SelfID, signedViewDataToString(svd), err)
 				continue
 			}
-			if err := ValidateInFlight(vd.GetInFlightProposal(), 0); err != nil {
+			if err := ValidateInFlightEntries(vd, 0, v.depth()); err != nil {
 				v.Logger.Warnf("Node %d is processing newView message, but the in flight proposal of %s is invalid, error: %v", v.SelfID, signedViewDataToString(svd), err)
 				return false, false, false, nil
 			}
@@ -1059,7 +1178,7 @@ func (v *ViewChanger) validateNewViewMsg(msg *protos.NewView) (valid bool, sync 
 				v.Logger.Warnf("Node %d is processing newView message, but signature of %s is invalid, ignoring it, error: %v", v.SelfID, signedViewDataToString(svd), err)
 				continue
 			}
-			if err := ValidateInFlight(vd.GetInFlightProposal(), lastDecisionMD.GetLatestSequence()); err != nil {
+			if err := ValidateInFlightEntries(vd, lastDecisionMD.GetLatestSequence(), v.depth()); err != nil {
 				v.Logger.Warnf("Node %d is processing newView message, but the in flight proposal of %s is invalid, error: %v", v.SelfID, signedViewDataToString(svd), err)
 				return false, false, false, nil
 			}
@@ -1080,7 +1199,7 @@ func (v *ViewChanger) validateNewViewMsg(msg *protos.NewView) (valid bool, sync 
 				return false, false, false, nil
 			}
 
-			if err := ValidateInFlight(vd.GetInFlightProposal(), lastDecisionMD.GetLatestSequence()); err != nil {
+			if err := ValidateInFlightEntries(vd, lastDecisionMD.GetLatestSequence(), v.depth()); err != nil {
 				v.Logger.Warnf("Node %d is processing newView message, but the in flight proposal of %s is invalid, error: %v", v.SelfID, signedViewDataToString(svd), err)
 				return false, false, false, nil
 			}
@@ -1128,7 +1247,7 @@ func (v *ViewChanger) validateNewViewMsg(msg *protos.NewView) (valid bool, sync 
 			return false, false, false, nil
 		}
 
-		if err = ValidateInFlight(vd.GetInFlightProposal(), lastDecisionMD.GetLatestSequence()); err != nil {
+		if err = ValidateInFlightEntries(vd, lastDecisionMD.GetLatestSequence(), v.depth()); err != nil {
 			v.Logger.Warnf("Node %d is processing newView message, but the in flight proposal of %s is invalid, error: %v", v.SelfID, signedViewDataToString(svd), err)
 			return false, false, false, nil
 		}
@@ -1186,8 +1305,8 @@ func (v *ViewChanger) processNewViewMsg(msg *protos.NewView) {
 		return
 	}
 
-	// only the view data that was authenticated is counted when deciding on the in flight proposal
-	ok, noInFlight, inFlightProposal, err := CheckInFlight(authenticated, v.f, v.quorum, v.N, v.Verifier)
+	// only the view data that was authenticated is counted when deciding on the in flight proposals
+	ok, prefix, err := CheckInFlightPrefix(authenticated, v.f, v.quorum, v.depth())
 	if err != nil {
 		v.Logger.Panicf("The check of the in flight proposal by node %d returned an error: %v", v.SelfID, err)
 	}
@@ -1196,9 +1315,24 @@ func (v *ViewChanger) processNewViewMsg(msg *protos.NewView) {
 		return
 	}
 
-	if !noInFlight && !v.commitInFlightProposal(inFlightProposal) {
-		v.Logger.Warnf("Node %d was unable to commit the in flight proposal, not changing the view", v.SelfID)
-		return
+	// The prefix is committed in order; every proposal must follow this node's checkpoint when its turn comes.
+	// A proposal the checkpoint already passed (delivered meanwhile, by a sync or by the previous attempt) is
+	// skipped; a gap means a sync moved the checkpoint past the prefix, and the view change is retried.
+	for i, inFlightProposal := range prefix {
+		mySequence, _ := v.extractCurrentSequence()
+		seq := proposalSequenceOf(types.Proposal{Metadata: inFlightProposal.GetMetadata()})
+		if seq <= mySequence {
+			v.Logger.Debugf("Node %d already delivered sequence %d, skipping it in the prefix", v.SelfID, seq)
+			continue
+		}
+		if seq != mySequence+1 {
+			v.Logger.Warnf("Node %d is at sequence %d but the next proposal of the prefix has sequence %d, not changing the view", v.SelfID, mySequence, seq)
+			return
+		}
+		if !v.commitInFlightProposal(inFlightProposal) {
+			v.Logger.Warnf("Node %d was unable to commit the in flight proposal, not changing the view (proposal %d of %d of the prefix)", v.SelfID, i+1, len(prefix))
+			return
+		}
 	}
 
 	mySequence, _ := v.extractCurrentSequence()
@@ -1274,6 +1408,11 @@ func (v *ViewChanger) commitInFlightProposal(proposal *protos.Proposal) (success
 			}
 			return true // I already decided on the in flight proposal
 		}
+		if lastDecisionMD.GetLatestSequence() > proposalMD.GetLatestSequence() {
+			// A sync moved the checkpoint past the proposal while the prefix was being committed.
+			v.Logger.Debugf("Node %d already decided on sequence %d, above the in flight proposal with sequence %d, so it will not commit it", v.SelfID, lastDecisionMD.GetLatestSequence(), proposalMD.GetLatestSequence())
+			return true
+		}
 		if lastDecisionMD.GetLatestSequence() != proposalMD.GetLatestSequence()-1 {
 			v.Logger.Panicf("Node %d got an in flight proposal with sequence %d while its last decision was on sequence %d", v.SelfID, proposalMD.GetLatestSequence(), lastDecisionMD.GetLatestSequence())
 		}
@@ -1316,6 +1455,9 @@ func (v *ViewChanger) commitInFlightProposal(proposal *protos.Proposal) (success
 		Phase:              PREPARED,
 		MetricsBlacklist:   v.MetricsBlacklist,
 		MetricsView:        v.MetricsView,
+		// The commits of the sequences above this one, which the nodes ahead send while the prefix is being
+		// committed, are accepted into their slots instead of being taken for a sign that this node is behind.
+		PipelineDepth: v.PipelineDepth,
 	}
 	attempt.viewRef = inFlightView
 	inFlightView.MetricsView.ViewNumber.Set(float64(inFlightView.Number))
