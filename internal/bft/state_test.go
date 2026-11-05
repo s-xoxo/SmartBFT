@@ -21,10 +21,11 @@ import (
 )
 
 func TestStateRestore(t *testing.T) {
+	// The metadata names the record's view and sequence, as a verified proposal's does; the restore checks it.
 	proposedRecord := newProposalRecord(200, 300, &protos.ViewMetadata{
 		DecisionsInView: 0,
-		LatestSequence:  0,
-		ViewId:          1,
+		LatestSequence:  200,
+		ViewId:          300,
 	})
 	prePrepare := proposedRecord.GetProposedRecord().GetPrePrepare()
 

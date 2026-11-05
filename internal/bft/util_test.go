@@ -561,3 +561,36 @@ func TestInFlightDataMultiplex(t *testing.T) {
 	ifp.clear()
 	require.Nil(t, ifp.InFlightProposal())
 }
+
+// TestInFlightDataClearAboveAndEntries covers rule D1's primitive and the ordered view of the entries: clearAbove
+// forgets the sequences above the new low watermark and keeps the one at it; inFlightEntries lists them in order;
+// a prepared flag from a commit of another view than the proposal's is refused.
+func TestInFlightDataClearAboveAndEntries(t *testing.T) {
+	proposalAt := func(seq, view uint64) types.Proposal {
+		return types.Proposal{Payload: []byte{byte(seq)}, Metadata: MarshalOrPanic(&protos.ViewMetadata{ViewId: view, LatestSequence: seq})}
+	}
+	ifp := &InFlightData{}
+	for seq := uint64(5); seq <= 8; seq++ {
+		ifp.StoreProposal(proposalAt(seq, 1))
+	}
+	require.True(t, ifp.StorePrepares(1, 6))
+	require.False(t, ifp.StorePrepares(2, 7), "a commit of another view is no evidence about this proposal")
+
+	entries := ifp.inFlightEntries()
+	require.Len(t, entries, 4)
+	for i, e := range entries {
+		require.Equal(t, uint64(5+i), e.seq)
+		require.Equal(t, proposalAt(e.seq, 1), *e.proposal)
+		require.Equal(t, e.seq == 6, e.prepared)
+	}
+
+	// The view that starts at 7 discards 8 (D1) and keeps 7, the proposal it did not get decided.
+	ifp.clearAbove(7)
+	entries = ifp.inFlightEntries()
+	require.Equal(t, []uint64{5, 6, 7}, []uint64{entries[0].seq, entries[1].seq, entries[2].seq})
+	ifp.clearAbove(4)
+	require.Empty(t, ifp.inFlightEntries())
+
+	var none *InFlightData
+	none.clearAbove(1) // a controller built without in-flight data
+}
