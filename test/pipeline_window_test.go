@@ -73,6 +73,18 @@ func (l *windowLogs) count(id uint64, substr string) int {
 	return n
 }
 
+// indexOf returns the position of the first entry of the node containing substr, or -1.
+func (l *windowLogs) indexOf(id uint64, substr string) int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for i, e := range l.entries[id] {
+		if strings.Contains(e, substr) {
+			return i
+		}
+	}
+	return -1
+}
+
 func (l *windowLogs) maxInFlight() int {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -381,38 +393,47 @@ func TestPipelineRestartRestoresInFlight(t *testing.T) {
 	requireIdenticalInOrder(t, c.collect(3), 3)
 }
 
-// TestPipelineLeaderRestartWithInFlight covers the restored leader: with the followers' commits held it has
-// two proposals in flight, prepared, when it restarts. It restores both, issues W-2 = 1 token (so it proposes
-// exactly one more sequence before any decision), and once the commits flow every node delivers the four
-// sequences identically.
+// TestPipelineLeaderRestartWithInFlight covers the restored leader: it loses the commits of its first two
+// proposals, so it has both in flight, prepared, when it restarts while the followers delivered them. It restores
+// both, issues W-2 = 1 token (so it proposes exactly one more sequence before it decides anything), completes the
+// two through the followers' answers to its commits, and then every node has the same four records.
 func TestPipelineLeaderRestartWithInFlight(t *testing.T) {
 	t.Parallel()
-	c := newWindowCluster(t, 3, nil)
+	var leaderLosesCommits atomic.Bool
+	leaderLosesCommits.Store(true)
+	c := newWindowCluster(t, 3, func(n *App) {
+		if n.ID == 1 {
+			n.LoseMessages(func(msg *smartbftprotos.Message) bool { return leaderLosesCommits.Load() && msg.GetCommit() != nil })
+		}
+	})
 	defer c.network.Shutdown()
 
-	// The commits are held for the whole scenario, which must stay well below the request complain timeout.
-	release := holdCommits(c.nodes, []uint64{2, 3, 4}, []uint64{1, 2, 3, 4})
 	c.submit(2)
-	// The leader reaches a prepare quorum for both (its commit records are the last it writes).
+	followers := c.collectFrom([]int{2, 3, 4}, 2, 30*time.Second)
+	requireIdenticalInOrder(t, followers, 1)
 	c.logs.waitFor(t, 1, "Processed prepares for proposal with seq 1")
 	c.logs.waitFor(t, 1, "Processed prepares for proposal with seq 2")
-	require.Zero(t, c.logs.count(1, "Deciding on seq"))
+	require.Zero(t, c.logs.count(1, "Deciding on seq"), "the leader must not decide while it loses the commits")
 
 	leader := c.nodes[0]
+	leaderLosesCommits.Store(false)
 	leader.RestartSync(false)
 	c.logs.waitFor(t, 1, "Restored 2 proposals in flight, sequences 1 to 2")
 
-	// One token left: the third request is proposed, the fourth waits for a decision.
+	// One token left: the third request is proposed at once, the fourth only after a decision, which the leader
+	// reaches once the followers answer its commits from their delivered slots.
 	c.submit(2)
 	c.logs.waitFor(t, 1, "Proposing proposal sequence 3 in view 0")
-	time.Sleep(300 * time.Millisecond)
-	require.Zero(t, c.logs.count(1, "Proposing proposal sequence 4"), "the restored leader exceeded its window")
-	require.Zero(t, c.logs.count(1, "Deciding on seq"))
-
-	release()
-	records := c.collect(4)
-	requireIdenticalInOrder(t, records, 1)
 	c.logs.waitFor(t, 1, "Proposing proposal sequence 4 in view 0")
+	decided := c.logs.indexOf(1, "Deciding on seq 1")
+	proposed4 := c.logs.indexOf(1, "Proposing proposal sequence 4 in view 0")
+	require.NotEqual(t, -1, decided)
+	require.Less(t, decided, proposed4, "the fourth proposal must wait for a decision: W-2 tokens after the restore")
+
+	leaderRecords := c.collectFrom([]int{1}, 4, 60*time.Second)
+	rest := c.collectFrom([]int{2, 3, 4}, 2, 60*time.Second)
+	require.Equal(t, followers[0], leaderRecords[0][:2])
+	requireIdenticalInOrder(t, [][]*AppRecord{leaderRecords[0][2:], rest[0], rest[1], rest[2]}, 3)
 }
 
 // TestPipelineRestartAfterDeliveryStartsClean covers the checkpoint filter: a leader that restarts right after
